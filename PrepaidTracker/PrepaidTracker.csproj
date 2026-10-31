@@ -1,0 +1,79 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <!-- Both platforms build from this one project. Each CI workflow narrows to
+         its own TFM via -p:TargetFrameworks=… so neither needs the other's workload. -->
+    <TargetFrameworks>net8.0-ios;net8.0-android</TargetFrameworks>
+    <OutputType>Exe</OutputType>
+    <RootNamespace>PrepaidTracker</RootNamespace>
+    <UseMaui>true</UseMaui>
+    <SingleProject>true</SingleProject>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+
+    <!-- .NET 8 MAUI is past end-of-support; don't let the SDK turn that into
+         a build error (NETSDK1202). Pair this with global.json pinning 8.0.400. -->
+    <CheckEolTargetFramework>false</CheckEolTargetFramework>
+
+    <!-- DESCO's TLS chain is unreliable; SocketsHttpHandler lets us supply a
+         validation callback that NSUrlSessionHandler does not support. -->
+    <UseNativeHttpHandler>false</UseNativeHttpHandler>
+
+    <ApplicationTitle>Prepaid Tracker</ApplicationTitle>
+    <ApplicationId>com.example.prepaidtracker</ApplicationId>
+    <ApplicationDisplayVersion>1.0</ApplicationDisplayVersion>
+    <ApplicationVersion>1</ApplicationVersion>
+
+    <SupportedOSPlatformVersion Condition="$([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)')) == 'ios'">14.2</SupportedOSPlatformVersion>
+    <SupportedOSPlatformVersion Condition="$([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)')) == 'android'">26.0</SupportedOSPlatformVersion>
+  </PropertyGroup>
+
+  <!-- App icon, per platform. Android needs a two-layer adaptive icon (background
+       plate + foreground art inside the safe zone) or the launcher mask crops the
+       bolt; iOS takes one opaque full-bleed square. A single cross-platform
+       MauiIcon can't be both, so condition them on the TFM. Exactly one must match
+       each TFM: with none matching, Resizetizer emits no icon at all. -->
+  <ItemGroup Condition="$(TargetFramework.Contains('android'))">
+    <MauiIcon Include="Resources\AppIcon\appicon_android.png"
+              ForegroundFile="Resources\AppIcon\appicon_fg.png"
+              Color="#03060D" />
+  </ItemGroup>
+
+  <ItemGroup Condition="$(TargetFramework.Contains('ios'))">
+    <MauiIcon Include="Resources\AppIcon\appicon_ios.svg" Color="#03060D" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Splash Screen -->
+    <MauiSplashScreen Include="Resources\Splash\splash.svg" Color="#0B0F0B" BaseSize="128,128" />
+
+    <!-- Tab bar icons. Resizetizer rasterizes these SVGs to tab_home.png etc. -->
+    <MauiImage Include="Resources\Images\*.svg" BaseSize="24,24" />
+  </ItemGroup>
+
+  <!-- WorkManager: the Android daily sync, and the queued low-balance alert.
+
+       The three Collection pins are the price of it. Work.Runtime drags in Collection.Jvm
+       1.4.x, while MAUI 8.0.100 still resolves Collection.Ktx 1.2.x, and both jars carry
+       androidx/collection/ArrayMapKt.class — D8 fails with "Type
+       androidx.collection.ArrayMapKt is defined multiple times". From 1.4 the ktx artifact
+       is a shim over the jvm one and stops duplicating the class, so lifting ktx to match
+       removes the duplicate instead of papering over it.
+
+       The version is 1.4.0.4, not 1.4.0.3: Work.Runtime -> Core 1.13.1.1 floors Collection
+       at 1.4.0.4, and pinning under a transitive floor is a downgrade, which NuGet raises
+       as NU1605. If these ever need moving again, move them together and never below what
+       Core asks for. -->
+  <ItemGroup Condition="$([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)')) == 'android'">
+    <PackageReference Include="Xamarin.AndroidX.Work.Runtime" Version="2.9.0.3" />
+    <PackageReference Include="Xamarin.AndroidX.Collection" Version="1.4.0.4" />
+    <PackageReference Include="Xamarin.AndroidX.Collection.Jvm" Version="1.4.0.4" />
+    <PackageReference Include="Xamarin.AndroidX.Collection.Ktx" Version="1.4.0.4" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Maui.Controls" Version="8.0.100" />
+    <PackageReference Include="Microsoft.Maui.Controls.Compatibility" Version="8.0.100" />
+  </ItemGroup>
+
+</Project>

@@ -1,0 +1,494 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0C1210">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>Prepaid Tracker — users</title>
+<style>
+  :root {
+    color-scheme: dark;
+    --bg:#0C1210; --card:#141C19; --card2:#1B2622; --line:#233029; --line2:#1a2420;
+    --text:#E8F0EC; --muted:#8B9A93; --faint:#5F6E67;
+    --green:#2FBD7E; --amber:#F5C451; --red:#FF6B5E; --ink:#08130D;
+  }
+  * { box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  [hidden] { display:none !important; }   /* author `display` rules outrank the UA stylesheet */
+
+  body {
+    margin:0; background:var(--bg); color:var(--text);
+    font:15px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    padding: env(safe-area-inset-top) 16px calc(32px + env(safe-area-inset-bottom));
+  }
+  .wrap { max-width:640px; margin:0 auto; }
+
+  /* ---- header: title and actions on ONE line, not stacked and floating ---- */
+  header {
+    display:flex; align-items:baseline; gap:12px;
+    padding:22px 2px 14px; border-bottom:1px solid var(--line);
+  }
+  h1 { font-size:19px; margin:0; letter-spacing:-.01em; }
+  .tally { color:var(--faint); font-size:13px; margin-right:auto; }
+  .link {
+    background:none; border:0; padding:6px 2px; margin:0; cursor:pointer;
+    color:var(--muted); font-size:13px; font-weight:500;
+  }
+  .link:hover { color:var(--text); }
+  .link:disabled { opacity:.4; }
+
+  /* ---- toolbar: the whole point of this page at 1,000 users is FINDING one ---- */
+  .tools { display:flex; gap:8px; padding:14px 0 4px; flex-wrap:wrap; align-items:center; }
+  .search { flex:1; min-width:180px; position:relative; display:flex; }
+  .search input { padding:10px 34px 10px 12px; font-size:14px; }
+  .clear {
+    position:absolute; right:2px; top:2px; bottom:2px; width:30px;
+    background:transparent; border:0; color:var(--faint); cursor:pointer; font-size:15px;
+  }
+  .chips { display:flex; gap:6px; }
+  .chip {
+    background:var(--card); border:1px solid var(--line); color:var(--muted);
+    border-radius:999px; padding:8px 12px; font-size:12.5px; font-weight:600; cursor:pointer;
+    white-space:nowrap;
+  }
+  .chip.on { background:var(--card2); border-color:#3a4a42; color:var(--text); }
+  .chip .n { color:var(--faint); font-weight:500; margin-left:4px; }
+
+  /* Rows-per-page. Sits with the chips; on a phone it wraps under them. */
+  .per { display:flex; align-items:center; gap:6px; margin-left:auto; }
+  .per label { color:var(--faint); font-size:12.5px; margin:0; white-space:nowrap; }
+  .per select {
+    background:var(--card); border:1px solid var(--line); color:var(--text);
+    border-radius:8px; padding:8px 9px; font-size:12.5px; font-weight:600; cursor:pointer;
+  }
+  .per select:focus { outline:none; border-color:#3a4a42; }
+  .per input {
+    width:72px; padding:8px 9px; font-size:12.5px; font-weight:600; border-radius:8px;
+  }
+
+  .more {
+    width:100%; margin-top:14px; background:var(--card); border:1px solid var(--line);
+    color:var(--muted); border-radius:10px; padding:11px; font-size:13px; font-weight:600;
+    cursor:pointer;
+  }
+  .more:hover { color:var(--text); border-color:#3a4a42; }
+
+  .msg { padding:14px 2px; font-size:13.5px; color:var(--muted); }
+  .msg.err { color:var(--red); }
+
+  /* ---- the list: rows, not floating cards ---- */
+  .list { display:flex; flex-direction:column; }
+  .row {
+    display:grid; grid-template-columns:auto 1fr auto;
+    align-items:center; gap:0 12px;
+    padding:14px 2px; border-bottom:1px solid var(--line2);
+  }
+
+  /* A dot instead of a pill: status is a glance, not a paragraph. */
+  .dot { width:8px; height:8px; border-radius:50%; background:var(--green); }
+  .dot.suspended { background:var(--amber); }
+  .dot.revoked { background:var(--red); }
+
+  .who { min-width:0; }
+  .name { font-size:15px; font-weight:600; word-break:break-all; }
+  .meta { color:var(--faint); font-size:12px; margin-top:1px; }
+  .meta .state { color:var(--muted); font-weight:600; }
+  .meta .state.suspended { color:var(--amber); }
+  .meta .state.revoked { color:var(--red); }
+
+  .acts { display:flex; gap:6px; }
+  .acts button {
+    border:1px solid var(--line); background:var(--card); color:var(--muted);
+    border-radius:9px; padding:7px 11px; font-size:12.5px; font-weight:600;
+    cursor:pointer; white-space:nowrap; min-height:34px;
+  }
+  .acts button:hover { border-color:#3a4a42; color:var(--text); }
+  .acts button.danger:hover { border-color:var(--red); color:var(--red); }
+  .acts button.go { background:var(--green); color:var(--ink); border-color:transparent; }
+  .acts button:disabled { opacity:.45; }
+
+  .empty { color:var(--faint); font-size:14px; padding:32px 2px; text-align:center; }
+  .note { color:var(--faint); font-size:12px; padding:16px 2px 0; line-height:1.6; }
+
+  /* ---- sign in ---- */
+  .signin { display:flex; flex-direction:column; gap:6px; max-width:340px; margin:40px auto; }
+  .signin h2 { margin:0 0 12px; font-size:17px; }
+  label { color:var(--muted); font-size:12px; margin-top:8px; }
+  input {
+    width:100%; background:var(--card); border:1px solid var(--line); color:var(--text);
+    padding:12px 13px; border-radius:10px; font-size:16px;   /* 16px: iOS zooms below this */
+  }
+  input:focus { outline:none; border-color:#3a4a42; }
+  .pw { position:relative; display:flex; }
+  .pw input { padding-right:46px; }
+  .peek {
+    position:absolute; right:3px; top:3px; bottom:3px; width:40px;
+    background:transparent; border:0; color:var(--faint); font-size:15px; cursor:pointer;
+  }
+  .signin .go {
+    margin-top:18px; background:var(--green); color:var(--ink); border:0;
+    border-radius:10px; padding:12px; font-size:15px; font-weight:700; cursor:pointer;
+  }
+  .signin .go:disabled { opacity:.5; }
+
+  /* Phone: name over meta, actions drop to their own line but stay small. */
+  @media (max-width:520px) {
+    .row { grid-template-columns:auto 1fr; row-gap:10px; }
+    .acts { grid-column:1 / -1; justify-content:flex-end; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <form id="signin" class="signin" autocomplete="on">
+    <h2>Sign in</h2>
+    <label for="user">Username</label>
+    <input id="user" name="username" type="text" value="admin" autocomplete="username"
+           autocapitalize="off" autocorrect="off" spellcheck="false" required>
+    <label for="pass">Password</label>
+    <div class="pw">
+      <input id="pass" name="password" type="password" autocomplete="current-password" required>
+      <button type="button" id="peek" class="peek" aria-label="Show password">👁</button>
+    </div>
+    <button id="go" type="submit" class="go">Sign in</button>
+    <div id="autherr" class="msg err"></div>
+  </form>
+
+  <div id="app" hidden>
+    <header>
+      <h1>Users</h1>
+      <span id="tally" class="tally"></span>
+      <button id="refresh" class="link">Refresh</button>
+      <button id="out" class="link">Sign out</button>
+    </header>
+
+    <div class="tools">
+      <div class="search">
+        <input id="q" type="search" placeholder="Search name, device…"
+               autocapitalize="off" autocorrect="off" spellcheck="false">
+        <button id="qclear" class="clear" hidden aria-label="Clear">✕</button>
+      </div>
+      <div class="chips">
+        <button class="chip on" data-filter="all">All <span class="n" id="n-all"></span></button>
+        <button class="chip" data-filter="active">Active <span class="n" id="n-active"></span></button>
+        <button class="chip" data-filter="blocked">Blocked <span class="n" id="n-blocked"></span></button>
+      </div>
+
+      <div class="per">
+        <label for="per">Rows</label>
+        <select id="per">
+          <option value="20">20</option>
+          <option value="50" selected>50</option>
+          <option value="100">100</option>
+          <option value="all">All</option>
+          <option value="custom">Custom…</option>
+        </select>
+        <input id="perCustom" type="number" min="1" max="5000" step="1" placeholder="e.g. 35" hidden>
+      </div>
+    </div>
+
+    <div id="msg" class="msg"></div>
+    <div id="list" class="list"></div>
+    <button id="more" class="more" hidden></button>
+    <div id="empty" class="empty" hidden>Nobody has registered yet.</div>
+
+    <p class="note">
+      <strong>Suspend</strong> walls the app; their data stays on the phone and comes back when you unblock.<br>
+      <strong>Revoke</strong> also deletes their customer list from the device — that cannot be undone.
+    </p>
+  </div>
+
+</div>
+
+<script>
+  const $ = (id) => document.getElementById(id);
+
+  let token = sessionStorage.getItem('session') || '';
+  const hdr = () => ({ 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json' });
+
+  const ago = (iso) => {
+    const s = (Date.now() - new Date(iso)) / 1000;
+    if (s < 90) return 'just now';
+    if (s < 3600) return Math.round(s / 60) + 'm ago';
+    if (s < 86400) return Math.round(s / 3600) + 'h ago';
+    return Math.round(s / 86400) + 'd ago';
+  };
+
+  const say = (t, err) => { $('msg').textContent = t || ''; $('msg').className = 'msg' + (err ? ' err' : ''); };
+  const showApp = (on) => { $('signin').hidden = on; $('app').hidden = !on; };
+
+  function signOut(reason) {
+    token = '';
+    sessionStorage.removeItem('session');
+    showApp(false);
+    $('autherr').textContent = reason || '';
+    $('pass').value = '';
+    $('pass').focus();
+  }
+
+  // ---- sign in ----
+  $('peek').onclick = () => {
+    const p = $('pass');
+    p.type = p.type === 'password' ? 'text' : 'password';
+    p.focus();
+  };
+
+  $('signin').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    $('go').disabled = true;
+    $('go').textContent = 'Signing in…';
+    $('autherr').textContent = '';
+    try {
+      const res = await fetch('/admin/api/login', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username: $('user').value.trim(), password: $('pass').value })
+      });
+      if (res.status === 429) { $('autherr').textContent = 'Too many attempts. Wait 15 minutes.'; return; }
+      if (res.status === 503) { $('autherr').textContent = 'Sign-in is not configured on the server.'; return; }
+      if (!res.ok) { $('autherr').textContent = 'Wrong username or password.'; return; }
+
+      token = (await res.json()).token;
+      sessionStorage.setItem('session', token);
+      $('pass').value = '';
+      showApp(true);
+      load();
+    } catch {
+      $('autherr').textContent = "Couldn't reach the server. It may be waking up — try again.";
+    } finally {
+      $('go').disabled = false;
+      $('go').textContent = 'Sign in';
+    }
+  });
+
+  // ---- the list ----
+  async function load() {
+    $('refresh').disabled = true;
+    say('Loading…');
+    try {
+      const res = await fetch('/admin/api/users', { headers: hdr() });
+      if (res.status === 401) { signOut('Your session expired. Sign in again.'); return; }
+      if (!res.ok) { say('Server error.', true); return; }
+      render(await res.json());
+      say('');
+    } catch {
+      say('Could not reach the server. It may be waking up — try again.', true);
+    } finally {
+      $('refresh').disabled = false;
+    }
+  }
+
+  // ---- state: fetched once, filtered in the browser ----
+  //
+  // At 1,000 users the server still returns the whole list in one ~150 KB response from
+  // memory — that is not the problem. The PAGE is: a thousand rows you have to scroll to
+  // find one person. So: search + filter here, and render only a window of them, because
+  // a thousand DOM rows makes scrolling stutter on a phone for no benefit — you can't read
+  // a thousand rows anyway.
+  let all = [];
+  let filter = 'all';
+  let query = '';
+
+  // How many rows to draw at once. Kept in localStorage: whoever runs this page has a
+  // screen and a preference, and re-choosing "20" on every sign-in is a small daily tax.
+  // Clamped to 1..5000 on the way in — a hand-typed 999999 would freeze the tab, and the
+  // value comes from a text box.
+  const PER_KEY = 'rowsPerPage';
+  const clamp = (n) => Math.min(Math.max(Math.round(n), 1), 5000);
+
+  function loadPer() {
+    const raw = localStorage.getItem(PER_KEY);
+    if (raw === 'all') return 'all';
+    const n = Number(raw);
+    return Number.isFinite(n) && n > 0 ? clamp(n) : 50;
+  }
+
+  let per = loadPer();                     // a number, or the string 'all'
+  let shown = per === 'all' ? Infinity : per;
+
+  const matches = (u) => {
+    if (filter === 'active' && u.blocked) return false;
+    if (filter === 'blocked' && !u.blocked) return false;
+    if (!query) return true;
+    const hay = `${u.username} ${u.platform || ''} ${u.model || ''} ${u.app_version || ''}`.toLowerCase();
+    return hay.includes(query);
+  };
+
+  function render(users) {
+    if (users) { all = users; resetPage(); }   // fresh data: back to page one
+
+    const blocked = all.filter((u) => u.blocked).length;
+    $('n-all').textContent = all.length;
+    $('n-active').textContent = all.length - blocked;
+    $('n-blocked').textContent = blocked;
+    $('tally').textContent = all.length
+      ? `${all.length} total${blocked ? ` · ${blocked} blocked` : ''}`
+      : '';
+
+    const hits = all.filter(matches);
+    const page = hits.slice(0, shown);
+
+    const list = $('list');
+    list.innerHTML = '';
+    for (const u of page) list.append(rowFor(u));
+
+    $('empty').hidden = hits.length > 0;
+    $('empty').textContent = !all.length
+      ? 'Nobody has registered yet.'
+      : 'No user matches that.';
+
+    const rest = hits.length - page.length;
+    $('more').hidden = rest <= 0;
+    if (rest > 0) {
+      const step = per === 'all' ? rest : per;
+      $('more').textContent = `Show ${Math.min(rest, step)} more (${rest} hidden)`;
+    }
+  }
+
+  function rowFor(u) {
+    const state = !u.blocked ? '' : (u.wipe ? 'revoked' : 'suspended');
+    const label = !u.blocked ? 'Active' : (u.wipe ? 'Revoked' : 'Suspended');
+
+    const row = document.createElement('div');
+    row.className = 'row';
+
+    const dot = document.createElement('span');
+    dot.className = 'dot ' + state;
+
+    const who = document.createElement('div');
+    who.className = 'who';
+    const name = document.createElement('div');
+    name.className = 'name';
+    name.textContent = u.username;
+    const meta = document.createElement('div');
+    meta.className = 'meta';
+    meta.innerHTML = `<span class="state ${state}">${label}</span> · `
+      + [u.platform, u.model].filter(Boolean).join(' ')
+      + ` · v${u.app_version || '?'} · seen ${ago(u.last_seen)}`;
+    who.append(name, meta);
+
+    const acts = document.createElement('div');
+    acts.className = 'acts';
+
+    const send = async (btn, body) => {
+      btn.disabled = true;
+      const res = await fetch(`/admin/api/users/${encodeURIComponent(u.username)}/block`, {
+        method: 'POST', headers: hdr(), body: JSON.stringify(body)
+      });
+      if (res.status === 401) { signOut('Your session expired. Sign in again.'); return; }
+      load();
+    };
+
+    if (u.blocked) {
+      const unblock = document.createElement('button');
+      unblock.textContent = 'Unblock';
+      unblock.className = 'go';
+      unblock.onclick = () => send(unblock, { blocked: false });
+      acts.append(unblock);
+    } else {
+      const suspend = document.createElement('button');
+      suspend.textContent = 'Suspend';
+      suspend.onclick = () => send(suspend, { blocked: true });
+
+      // Separate button, not a checkbox: suspending someone and destroying months of
+      // their meter readings are different decisions.
+      const revoke = document.createElement('button');
+      revoke.textContent = 'Revoke';
+      revoke.className = 'danger';
+      revoke.onclick = () => {
+        if (!confirm(`Revoke ${u.username}?\n\nTheir customer list and reading history will be DELETED from their device. Unblocking will not bring it back.\n\nTo lock them out without losing their data, use Suspend.`)) return;
+        send(revoke, { blocked: true, wipe: true });
+      };
+
+      acts.append(suspend, revoke);
+    }
+
+    row.append(dot, who, acts);
+    return row;
+  }
+
+  // ---- toolbar wiring ----
+  $('q').addEventListener('input', (e) => {
+    query = e.target.value.trim().toLowerCase();
+    $('qclear').hidden = !query;
+    resetPage();                     // a new search starts at the top
+    render();
+  });
+
+  $('qclear').onclick = () => {
+    $('q').value = '';
+    query = '';
+    $('qclear').hidden = true;
+    resetPage();
+    render();
+    $('q').focus();
+  };
+
+  for (const chip of document.querySelectorAll('.chip')) {
+    chip.onclick = () => {
+      document.querySelectorAll('.chip').forEach((c) => c.classList.remove('on'));
+      chip.classList.add('on');
+      filter = chip.dataset.filter;
+      resetPage();
+      render();
+    };
+  }
+
+  $('more').onclick = () => {
+    shown = per === 'all' ? Infinity : shown + per;
+    render();
+  };
+
+  // ---- rows-per-page ----
+  function resetPage() { shown = per === 'all' ? Infinity : per; }
+
+  function applyPer(value, remember = true) {
+    per = value;
+    if (remember) localStorage.setItem(PER_KEY, String(value));
+    resetPage();
+    render();
+  }
+
+  $('per').addEventListener('change', (e) => {
+    const v = e.target.value;
+
+    if (v === 'custom') {
+      $('perCustom').hidden = false;
+      $('perCustom').value = per === 'all' ? '' : per;
+      $('perCustom').focus();
+      $('perCustom').select();
+      return;                       // nothing changes until they type a number
+    }
+
+    $('perCustom').hidden = true;
+    applyPer(v === 'all' ? 'all' : clamp(Number(v)));
+  });
+
+  const commitCustom = () => {
+    const n = Number($('perCustom').value);
+    if (!Number.isFinite(n) || n < 1) return;   // empty or nonsense: leave it as it was
+    const c = clamp(n);
+    $('perCustom').value = c;                   // show them what they actually got
+    applyPer(c);
+  };
+
+  $('perCustom').addEventListener('change', commitCustom);
+  $('perCustom').addEventListener('keydown', (e) => { if (e.key === 'Enter') commitCustom(); });
+
+  // Restore the remembered choice into the controls on load.
+  (function initPer() {
+    const preset = ['20', '50', '100'];
+    if (per === 'all') { $('per').value = 'all'; return; }
+    if (preset.includes(String(per))) { $('per').value = String(per); return; }
+    $('per').value = 'custom';                   // a remembered custom number
+    $('perCustom').hidden = false;
+    $('perCustom').value = per;
+  })();
+
+  $('refresh').onclick = load;
+  $('out').onclick = () => signOut('');
+
+  if (token) { showApp(true); load(); } else { showApp(false); $('pass').focus(); }
+</script>
+</body>
+</html>

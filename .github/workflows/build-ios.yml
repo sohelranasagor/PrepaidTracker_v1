@@ -1,0 +1,129 @@
+name: Build Unsigned iOS IPA (for Sideloadly)
+
+# Produces an UNSIGNED .ipa. It will NOT install by itself — you sign it on
+# your PC with Sideloadly using a free Apple ID. No paid account, no secrets.
+
+on:
+  workflow_dispatch:
+  # push:
+    # branches: [ main, master ]
+
+jobs:
+  build-unsigned:
+    # Pinned instead of macos-latest: the -latest label migrated to macOS 26 in
+    # June 2026 (that's the notice on every run), and a surprise Xcode bump can
+    # break the net8.0-ios workload. Pinning also silences the annotation.
+    runs-on: macos-15
+
+    steps:
+      - name: Check out the code
+        uses: actions/checkout@v5
+
+      # Caches restored NuGet packages between runs so 'dotnet publish' doesn't
+      # re-download them every time. Keyed on the project files, so it refreshes
+      # automatically when dependencies change.
+      - name: Cache NuGet packages
+        uses: actions/cache@v5
+        with:
+          path: ~/.nuget/packages
+          key: nuget-${{ runner.os }}-${{ hashFiles('**/*.csproj', 'global.json') }}
+          restore-keys: |
+            nuget-${{ runner.os }}-
+
+      # The workload (iOS SDK packs, ~1 GB) lives in ~/.dotnet, NOT in the NuGet
+      # cache — without this it re-downloads on EVERY run and is the single
+      # biggest chunk of the build time (~3 minutes).
+      - name: Cache .NET SDK + MAUI iOS workload
+        id: dotnet-cache
+        uses: actions/cache@v5
+        with:
+          path: ~/.dotnet
+          key: dotnet-maui-ios-${{ runner.os }}-${{ hashFiles('global.json') }}-v2
+
+      - name: Set up .NET 8
+        if: steps.dotnet-cache.outputs.cache-hit != 'true'
+        uses: actions/setup-dotnet@v5
+        with:
+          # Reads the pinned version from global.json so the two can't drift.
+          global-json-file: global.json
+
+      # On a cache hit setup-dotnet is skipped, so wire the cached SDK into
+      # PATH/DOTNET_ROOT ourselves (harmless when setup-dotnet did run).
+      - name: Put the .NET SDK on PATH
+        run: |
+          echo "DOTNET_ROOT=$HOME/.dotnet" >> "$GITHUB_ENV"
+          echo "$HOME/.dotnet" >> "$GITHUB_PATH"
+
+      - name: Verify the SDK that global.json selected
+        run: |
+          # macos-latest ships newer SDKs; global.json must win, or the .NET 10
+          # SDK errors out on net8.0-ios (NETSDK1202).
+          echo "Selected SDK: $(dotnet --version)"
+          case "$(dotnet --version)" in
+            8.*) echo "OK — .NET 8 SDK in use." ;;
+            *) echo "::error::Expected a .NET 8 SDK. global.json is not being honoured."; exit 1 ;;
+          esac
+
+      # NOT gated on the cache hit. actions/cache saves ~/.dotnet in its post-step
+      # even when a job later fails, so a run that set up the SDK but died before the
+      # workload landed would cache a .dotnet WITHOUT the ios workload — and every run
+      # after that hits that cache, skips the install, and fails NETSDK1147. Running it
+      # unconditionally is a fast no-op when the workload is already present ("already
+      # installed") and self-heals a partial cache.
+      - name: Install MAUI iOS workload
+        run: dotnet workload install maui-ios
+
+      - name: Publish the app WITHOUT signing
+        run: |
+          # publish (not build) fully assembles the .app bundle. iOS-only via
+          # the TargetFrameworks override so the Android workload isn't needed.
+          dotnet publish PrepaidTracker/PrepaidTracker.csproj \
+            -c Release -f net8.0-ios \
+            -p:TargetFrameworks=net8.0-ios \
+            -p:RuntimeIdentifier=ios-arm64 \
+            -p:CodesignKey="" \
+            -p:CodesignProvision="" \
+            -p:EnableCodeSigning=false \
+            -p:_RequireCodeSigning=false \
+            -p:DisableCodesignManagerVerification=true \
+            -p:ArchiveOnBuild=false \
+            -p:BuildIpa=false
+
+      - name: Package the .app into an unsigned .ipa
+        run: |
+          # Find the published device app bundle (ignore intermediate obj copies).
+          APP_PATH=$(find . -type d -name "*.app" -path "*ios-arm64*" | grep -v "/obj/" | head -n 1)
+          if [ -z "$APP_PATH" ]; then
+            echo "::error::No .app bundle found."
+            find . -type d -name "*.app" || true
+            exit 1
+          fi
+          echo "==== Using app bundle: $APP_PATH ===="
+          ls -la "$APP_PATH"
+
+          echo "==== Bundle has Info.plist? ===="
+          test -f "$APP_PATH/Info.plist" && echo "yes" || echo "NO — bundle is incomplete"
+
+          echo "==== Main executable architecture ===="
+          EXE=$(basename "$APP_PATH" .app)
+          file "$APP_PATH/$EXE" 2>/dev/null || echo "(could not read main executable '$EXE')"
+
+          # Build the .ipa: a zip containing Payload/<App>.app at the root.
+          rm -rf Payload PrepaidTracker-unsigned.ipa
+          mkdir Payload
+          cp -R "$APP_PATH" Payload/
+          find Payload -name ".DS_Store" -delete
+          # -y preserves symlinks (frameworks inside the bundle rely on them).
+          zip -qry PrepaidTracker-unsigned.ipa Payload
+
+          echo "==== Final .ipa ===="
+          ls -lh PrepaidTracker-unsigned.ipa
+          echo "==== .ipa top-level contents ===="
+          unzip -l PrepaidTracker-unsigned.ipa | head -20
+
+      - name: Upload the unsigned IPA
+        uses: actions/upload-artifact@v6
+        with:
+          name: PrepaidTracker-unsigned-ipa
+          path: PrepaidTracker-unsigned.ipa
+          if-no-files-found: error

@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+	<!-- Resizetizer names the generated mipmaps after the MauiIcon FILE NAME. The Android
+	     MauiIcon is appicon_android.png, so the resources are mipmap/appicon_android and
+	     mipmap/appicon_android_round. These attributes still said "appicon", so aapt2
+	     failed: "resource mipmap/appicon ... not found". Rename the icon file and you must
+	     change these two attributes too — same trap as XSAppIconAssets in iOS's Info.plist. -->
+	<application android:allowBackup="true" android:icon="@mipmap/appicon_android" android:roundIcon="@mipmap/appicon_android_round" android:supportsRtl="true"></application>
+	<!-- Without INTERNET the app cannot reach DESCO/NESCO at all. -->
+	<uses-permission android:name="android.permission.INTERNET" />
+	<uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+	<!-- Android 13+ runtime permission for the low-balance notifications. -->
+	<uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+	<!-- Reliable background alerts: an exact daily alarm that fires through Doze even
+	     when the app is closed, plus re-arming it after a reboot. USE_EXACT_ALARM is
+	     granted at install for a reminder/alert app; SCHEDULE_EXACT_ALARM covers 12–12L. -->
+	<uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+	<uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
+	<uses-permission android:name="android.permission.USE_EXACT_ALARM" />
+</manifest>

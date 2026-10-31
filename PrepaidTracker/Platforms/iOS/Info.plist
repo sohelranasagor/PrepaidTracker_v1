@@ -1,0 +1,47 @@
+﻿<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>LSRequiresIPhoneOS</key>
+	<true/>
+	<key>UIDeviceFamily</key>
+	<array>
+		<integer>1</integer>
+		<integer>2</integer>
+	</array>
+	<key>UIRequiredDeviceCapabilities</key>
+	<array>
+		<string>arm64</string>
+	</array>
+	<key>UISupportedInterfaceOrientations</key>
+	<array>
+		<string>UIInterfaceOrientationPortrait</string>
+	</array>
+	<key>UISupportedInterfaceOrientations~ipad</key>
+	<array>
+		<string>UIInterfaceOrientationPortrait</string>
+		<string>UIInterfaceOrientationLandscapeLeft</string>
+		<string>UIInterfaceOrientationLandscapeRight</string>
+	</array>
+	<!-- Resizetizer names the generated icon set after the MauiIcon FILE NAME. The
+	     iOS MauiIcon is appicon_ios.svg, so the catalog holds appicon_ios.appiconset.
+	     This key still said "appicon", so actool went looking for a set that no longer
+	     exists: "None of the input catalogs contained a matching ... app icon set named
+	     appicon". Rename the iOS icon file and you must change this string too. -->
+	<key>XSAppIconAssets</key>
+	<string>Assets.xcassets/appicon_ios.appiconset</string>
+
+	<!-- Lets iOS wake the app to refresh the balance and fire a local alert.
+	     No push, no server. Requires Background App Refresh to be enabled. -->
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>fetch</string>
+		<string>processing</string>
+	</array>
+	<key>BGTaskSchedulerPermittedIdentifiers</key>
+	<array>
+		<string>com.example.prepaidtracker.refresh</string>
+		<string>com.example.prepaidtracker.process</string>
+	</array>
+</dict>
+</plist>

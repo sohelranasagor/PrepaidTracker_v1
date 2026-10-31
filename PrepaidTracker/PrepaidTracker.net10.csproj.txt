@@ -1,0 +1,55 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- ============================================================
+       ALTERNATIVE: .NET 10 version of the project.
+       Use this instead of PrepaidTracker.csproj if you'd rather move
+       forward than pin to the end-of-support .NET 8 SDK.
+
+       To switch:
+         1. Delete global.json (no pin needed).
+         2. Replace PrepaidTracker.csproj with this file's contents.
+         3. In .github/workflows/build-ios.yml, replace every
+            'net8.0-ios' with 'net10.0-ios', and change the
+            setup-dotnet step back to:
+                with:
+                  dotnet-version: '10.0.x'
+            (and drop the "Verify the SDK" step).
+
+       Note: iOS 15.0 minimum. The C# source needs no changes.
+       ============================================================ -->
+
+  <PropertyGroup>
+    <TargetFrameworks>net10.0-ios</TargetFrameworks>
+    <OutputType>Exe</OutputType>
+    <RootNamespace>PrepaidTracker</RootNamespace>
+    <UseMaui>true</UseMaui>
+    <SingleProject>true</SingleProject>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+
+    <ApplicationTitle>Prepaid Tracker</ApplicationTitle>
+    <ApplicationId>com.example.prepaidtracker</ApplicationId>
+    <ApplicationDisplayVersion>1.0</ApplicationDisplayVersion>
+    <ApplicationVersion>1</ApplicationVersion>
+
+    <SupportedOSPlatformVersion Condition="$([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)')) == 'ios'">15.0</SupportedOSPlatformVersion>
+  </PropertyGroup>
+
+  <ItemGroup Condition="$(TargetFramework.Contains('android'))">
+    <MauiIcon Include="Resources\AppIcon\appicon_android.png"
+              ForegroundFile="Resources\AppIcon\appicon_fg.png"
+              Color="#03060D" />
+  </ItemGroup>
+
+  <ItemGroup Condition="$(TargetFramework.Contains('ios'))">
+    <MauiIcon Include="Resources\AppIcon\appicon_ios.svg" Color="#03060D" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <MauiSplashScreen Include="Resources\Splash\splash.svg" Color="#0B0F0B" BaseSize="128,128" />
+  </ItemGroup>
+
+  <!-- No PackageReference needed: UseMaui=true brings in Microsoft.Maui.Controls
+       at the version matching the SDK. Pinning 8.0.100 here would conflict. -->
+
+</Project>

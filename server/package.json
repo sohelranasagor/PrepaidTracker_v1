@@ -1,0 +1,19 @@
+{
+  "name": "prepaidtracker-access-api",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Username registry and owner-controlled block list for the Prepaid Tracker app.",
+  "main": "server.js",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2"
+  },
+  "optionalDependencies": {
+    "pg": "^8.12.0"
+  }
+}

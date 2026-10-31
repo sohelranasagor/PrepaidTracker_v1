@@ -1,0 +1,68 @@
+# Render Blueprint — free tier.
+#
+# Render dashboard → New → Blueprint → point it at this repo.
+#
+# THIS FILE ONLY APPLIES TO SERVICES CREATED FROM THE BLUEPRINT. If you made the service by
+# hand ("New → Web Service"), Render ignores this file completely and the dashboard is the
+# only thing that matters. In particular: editing `branch:` here can never fix a service
+# that is watching the wrong branch, because it will never see the commit that changes it.
+# Fix that in Settings → Build & Deploy → Branch.
+#
+# THE DATABASE IS NOT DEFINED HERE, ON PURPOSE. Render's FREE Postgres is DELETED 30 days
+# after it is created — not paused, deleted — and a free web service has an EPHEMERAL disk,
+# so a users.json written next to the code is gone at the next spin-down. Neither is a
+# place to keep a block list. So: free web service HERE, free Postgres at Neon (whose free
+# tier does not expire). Paste its connection string into DATABASE_URL when Render prompts.
+
+services:
+  - type: web
+    name: prepaidtracker-api
+    runtime: node
+    rootDir: server
+    plan: free
+
+    # Render watches ONE branch and defaults to `main`. This repo is on `master`. Without
+    # this line a blueprint-created service silently never deploys: no error, no build,
+    # nothing — it just waits on a branch that doesn't exist.
+    branch: main
+
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /health
+    autoDeploy: true
+
+    envVars:
+      # ---------------- storage ----------------
+      # Your Neon connection string. `sync: false` = Render prompts for it instead of
+      # inventing a value, and it never touches the repo.
+      - key: DATABASE_URL
+        sync: false
+
+      # Alternative, if you ever want NO database at all: leave DATABASE_URL unset and set
+      # GITHUB_TOKEN + GIST_ID instead — the user list then lives in a secret gist.
+      # The server picks whichever backend it finds. See server/store.js.
+
+      # ---------------- admin sign-in (/admin) ----------------
+      # Bearer token for curl/scripts, AND the HMAC secret that signs browser sessions.
+      # Rotate it and every open admin session dies with it.
+      - key: ADMIN_TOKEN
+        generateValue: true
+
+      - key: ADMIN_USER
+        value: admin
+
+      - key: ADMIN_PASSWORD
+        sync: false          # Render prompts you. Never commit it.
+
+      # ---------------- housekeeping ----------------
+      # Free a username after this many days of silence — the closest thing there is to
+      # detecting an uninstall, since neither iOS nor Android tells you one happened.
+      # Blocked users are NEVER reaped: freeing their row would hand the username back, and
+      # a blocked person who reinstalls is exactly the one who'd try. 0 disables reaping.
+      #
+      # The server reads process.env.REAP_AFTER_DAYS. Any other spelling is ignored.
+      - key: REAP_AFTER_DAYS
+        value: 60
+
+      - key: NODE_VERSION
+        value: 20
