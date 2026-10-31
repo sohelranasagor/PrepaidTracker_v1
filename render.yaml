@@ -24,7 +24,7 @@ services:
     # Render watches ONE branch and defaults to `main`. This repo is on `master`. Without
     # this line a blueprint-created service silently never deploys: no error, no build,
     # nothing — it just waits on a branch that doesn't exist.
-    branch: main
+    branch: master
 
     buildCommand: npm install
     startCommand: npm start
