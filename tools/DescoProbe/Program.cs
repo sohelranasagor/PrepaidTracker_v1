@@ -75,6 +75,38 @@ foreach (var p in prefixes)
         catch (Exception e) { Console.WriteLine($"ERR  {p}{leaf}  {e.Message}"); }
     }
 
+    Console.WriteLine("\n=== realtime-balance variants ===");
+    var b = $"{Base}/api/accounts/{accountId}/";
+    foreach (var (verb, leaf) in new[]
+    {
+        ("GET",  "realtime-balance"),
+        ("POST", "realtime-balance"),
+        ("GET",  $"realtime-balance?meterNo={meterNo}"),
+        ("POST", $"realtime-balance?meterNo={meterNo}"),
+        ("GET",  "balance"),
+        ("GET",  "meters"),
+        ("GET",  "monthly-consumption?monthFrom=2026-05&monthTo=2026-11"),
+        ("GET",  "consumption?monthFrom=2026-05&monthTo=2026-11"),
+        ("GET",  "usage?monthFrom=2026-05&monthTo=2026-11"),
+        ("GET",  "daily-consumption?dateFrom=2026-11-01&dateTo=2026-11-08"),
+        ("GET",  "token-status-messages"),
+    })
+    {
+        try
+        {
+            var rq = new HttpRequestMessage(new HttpMethod(verb), b + leaf);
+            rq.Headers.TryAddWithoutValidation("X-XSRF-TOKEN",
+                Uri.UnescapeDataString(jar.GetCookies(origin)["XSRF-TOKEN"]!.Value));
+            rq.Headers.Referrer = new Uri(Base + "/dashboard");
+            if (verb == "POST") rq.Content = new StringContent("{}", Encoding.UTF8, "application/json");
+            using var rs = await http.SendAsync(rq);
+            Console.WriteLine($"{(int)rs.StatusCode,3} {verb,-4} {leaf}");
+            if ((int)rs.StatusCode is 200 or 400 or 429)
+                Console.WriteLine($"     {Trim(await rs.Content.ReadAsStringAsync(), 400)}");
+        }
+        catch (Exception e) { Console.WriteLine($"ERR {verb,-4} {leaf}  {e.Message}"); }
+    }
+
 static string Esc(string s) => System.Text.Json.JsonSerializer.Serialize(s);
 static string Trim(string s, int n = 160) =>
     (s.Length > n ? s[..n] + "…" : s).ReplaceLineEndings(" ");
