@@ -1,98 +1,86 @@
 using System.Net;
 using System.Text;
 
-// Usage: dotnet run -- <email-or-phone> <password>
 var user = args.ElementAtOrDefault(0);
 var pass = args.ElementAtOrDefault(1);
+if (user is null || pass is null) { Console.WriteLine("usage: dotnet run -- <user> <pass>"); return; }
 
 const string Base = "https://prepaid.desco.org.bd";
 var origin = new Uri(Base);
 var jar = new CookieContainer();
-var handler = new SocketsHttpHandler
+var http = new HttpClient(new SocketsHttpHandler
 {
     CookieContainer = jar,
     UseCookies = true,
     SslOptions = { RemoteCertificateValidationCallback = (_, _, _, _) => true }
+})
+{ Timeout = TimeSpan.FromSeconds(20) };
+
+// ---- log in with the confirmed shape ----
+using (await http.GetAsync(Base + "/csrf")) { }
+var csrf = jar.GetCookies(origin)["XSRF-TOKEN"]!.Value;
+
+var req = new HttpRequestMessage(HttpMethod.Post, Base + "/api/auth/login")
+{ Content = new StringContent($"{{\"username\":{Esc(user)},\"password\":{Esc(pass)}}}", Encoding.UTF8, "application/json") };
+req.Headers.TryAddWithoutValidation("X-XSRF-TOKEN", Uri.UnescapeDataString(csrf));
+req.Headers.Referrer = new Uri(Base + "/login");
+using (var r = await http.SendAsync(req))
+    Console.WriteLine($"login: {(int)r.StatusCode}  {Trim(await r.Content.ReadAsStringAsync())}\n");
+
+// ---- the account list, in full ----
+Console.WriteLine("=== /api/accounts (full) ===");
+Console.WriteLine(await http.GetStringAsync(Base + "/api/accounts"));
+
+// ---- pull the ids out and probe account-scoped paths ----
+var body = await http.GetStringAsync(Base + "/api/accounts");
+var accountId = Between(body, "\"accountId\":", ",")?.Trim();
+var accountNo = Between(body, "\"accountNo\":\"", "\"");
+var meterNo = Between(body, "\"meterNo\":\"", "\"");
+Console.WriteLine($"\naccountId={accountId}  accountNo={accountNo}  meterNo={meterNo}\n");
+
+var from = DateTime.Today.AddMonths(-6).ToString("yyyy-MM-dd");
+var to = DateTime.Today.ToString("yyyy-MM-dd");
+var mFrom = DateTime.Today.AddMonths(-6).ToString("yyyy-MM");
+var mTo = DateTime.Today.ToString("yyyy-MM");
+
+string[] leaves =
+{
+    "realtime-balance", "balance", "summary", "monthly?monthFrom=" + mFrom + "&monthTo=" + mTo,
+    "transactions?dateFrom=" + from + "&dateTo=" + to, "daily?dateFrom=" + from + "&dateTo=" + to,
+    "consumption/daily?dateFrom=" + from + "&dateTo=" + to, "tokens", "token-status-messages", "details"
 };
-var http = new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(20) };
 
-Console.WriteLine("=== 1. find the CSRF path (looking for 204) ===");
-string? csrfPath = null;
-foreach (var p in new[] { "/api/csrf", "/api/v1/csrf", "/csrf", "/api/auth/csrf", "/api/security/csrf" })
+string[] prefixes =
 {
-    try
+    $"/api/accounts/{accountId}/",
+    $"/api/accounts/{accountNo}/",
+    $"/api/meters/{meterNo}/",
+    $"/api/customer/{accountId}/"
+};
+
+Console.WriteLine("=== account-scoped probe (looking for 200) ===");
+foreach (var p in prefixes)
+    foreach (var leaf in leaves)
     {
-        using var r = await http.GetAsync(Base + p);
-        Console.WriteLine($"  {p,-24} {(int)r.StatusCode}");
-        if ((int)r.StatusCode is 200 or 204) { csrfPath ??= p; }
-    }
-    catch (Exception e) { Console.WriteLine($"  {p,-24} ERR {e.Message}"); }
-}
-
-Console.WriteLine("\n=== 2. cookies now held ===");
-foreach (Cookie c in jar.GetCookies(origin))
-    Console.WriteLine($"  {c.Name} = {c.Value[..Math.Min(12, c.Value.Length)]}…  path={c.Path}");
-
-if (user is null || pass is null) { Console.WriteLine("\nNo credentials given; stopping."); return; }
-
-var csrf = jar.GetCookies(origin).Cast<Cookie>()
-    .FirstOrDefault(c => c.Name.Contains("csrf", StringComparison.OrdinalIgnoreCase)
-                      || c.Name.Contains("xsrf", StringComparison.OrdinalIgnoreCase));
-Console.WriteLine($"\nCSRF cookie detected: {csrf?.Name ?? "(none)"}");
-
-Console.WriteLine("\n=== 3. try login shapes ===");
-string[] paths  = { "/api/login", "/api/auth/login", "/api/v1/auth/login", "/login" };
-string[][] pairs = { new[]{"username","password"}, new[]{"email","password"},
-                     new[]{"identifier","password"}, new[]{"emailOrPhone","password"} };
-string[] headers = { "X-XSRF-TOKEN", "X-CSRF-TOKEN", "X-CSRF-Token" };
-
-foreach (var path in paths)
-foreach (var fields in pairs)
-{
-    var body = $"{{\"{fields[0]}\":{Esc(user)},\"{fields[1]}\":{Esc(pass)}}}";
-    using var req = new HttpRequestMessage(HttpMethod.Post, Base + path)
-    { Content = new StringContent(body, Encoding.UTF8, "application/json") };
-    if (csrf is not null)
-        foreach (var h in headers)
-            req.Headers.TryAddWithoutValidation(h, Uri.UnescapeDataString(csrf.Value));
-    req.Headers.Referrer = new Uri(Base + "/login");
-
-    try
-    {
-        using var res = await http.SendAsync(req);
-        var text = await res.Content.ReadAsStringAsync();
-        Console.WriteLine($"  {path,-22} {fields[0],-13} {(int)res.StatusCode}  {Trim(text)}");
-        if (res.IsSuccessStatusCode)
-        {
-            Console.WriteLine("\n*** LOGIN OK ***");
-            Console.WriteLine($"  PathCsrf   = \"{csrfPath}\"");
-            Console.WriteLine($"  PathLogin  = \"{path}\"");
-            Console.WriteLine($"  CsrfCookie = \"{csrf?.Name}\"");
-            Console.WriteLine($"  FieldUser  = \"{fields[0]}\"");
-            await Probe(http, Base);
-            return;
-        }
-    }
-    catch (Exception e) { Console.WriteLine($"  {path,-22} {fields[0],-13} ERR {e.Message}"); }
-}
-
-static string Esc(string s) => System.Text.Json.JsonSerializer.Serialize(s);
-static string Trim(string s) => s.Length > 110 ? s[..110].ReplaceLineEndings(" ") + "…" : s.ReplaceLineEndings(" ");
-
-static async Task Probe(HttpClient http, string b)
-{
-    Console.WriteLine("\n=== 4. data endpoints ===");
-    foreach (var p in new[] { "/api/session", "/api/accounts", "/api/realtime-balance",
-                              "/api/summary", "/api/daily", "/api/consumption/daily",
-                              "/api/monthly?monthFrom=2026-05&monthTo=2026-11",
-                              "/api/transactions?dateFrom=2026-05-08&dateTo=2026-11-09" })
-    {
+        var url = Base + p + leaf;
         try
         {
-            using var r = await http.GetAsync(b + p);
-            var t = await r.Content.ReadAsStringAsync();
-            Console.WriteLine($"  {p,-52} {(int)r.StatusCode}  {Trim(t)}");
+            using var res = await http.GetAsync(url);
+            var text = await res.Content.ReadAsStringAsync();
+            if ((int)res.StatusCode == 200)
+                Console.WriteLine($"200  {p}{leaf}\n     {Trim(text, 400)}");
+            else if ((int)res.StatusCode != 404)
+                Console.WriteLine($"{(int)res.StatusCode}  {p}{leaf}");
         }
-        catch (Exception e) { Console.WriteLine($"  {p,-52} ERR {e.Message}"); }
+        catch (Exception e) { Console.WriteLine($"ERR  {p}{leaf}  {e.Message}"); }
     }
+
+static string Esc(string s) => System.Text.Json.JsonSerializer.Serialize(s);
+static string Trim(string s, int n = 160) =>
+    (s.Length > n ? s[..n] + "…" : s).ReplaceLineEndings(" ");
+static string? Between(string s, string a, string b)
+{
+    var i = s.IndexOf(a, StringComparison.Ordinal); if (i < 0) return null;
+    i += a.Length;
+    var j = s.IndexOf(b, i, StringComparison.Ordinal); return j < 0 ? null : s[i..j];
 }
