@@ -153,6 +153,21 @@ public class ProfilePage : AppPage
         settings.Content = ss;
         _body.Add(settings);
 
+        // TEMPORARY: diagnostics card, to confirm the live-estimate fix on a device.
+        if (selected != null)
+        {
+            var dSnap = Store.Snapshot(selected.Id);
+            var dF = Forecast.Build(Store.Readings(selected.Id), dSnap);
+            var dText = DiagText(selected, dSnap, dF);
+
+            var diagCard = UI.Card();
+            diagCard.Content = new Label { Text = dText, FontFamily = "Menlo", FontSize = 10, TextColor = Theme.Muted };
+            _body.Add(diagCard);
+
+            var diagCopy = UI.Ghost(L.S("copyDiag"));
+            diagCopy.Clicked += async (_, _) => await Clipboard.SetTextAsync(dText);
+            _body.Add(diagCopy);
+        }
         // The diagnostics card lived here: endpoint names, probe results, raw field counts,
         // and a Copy button. It is a developer panel — it meant nothing to the person
         // holding the phone and it made the settings screen read like a debugger. Gone from
@@ -438,12 +453,16 @@ public class ProfilePage : AppPage
     /// </summary>
     static string DiagText(Meter m, Snapshot? snap, Forecast? f)
     {
+        // Run the estimate here so LiveWhyNot describes THIS meter, not whichever one
+        // the Home tab rendered last.
+        var live = Forecast.LiveEstimate(snap, f, m.Id);
+
         var lines = new List<string>
         {
             $"utility        {m.Utility.ToString().ToUpperInvariant()}",
             $"synced         {(snap != null ? snap.SyncedAt.ToString("g") : "never")}",
             $"balance        {(snap != null ? snap.Balance.ToString("0.00") : "—")}",
-            $"readingTime    {(snap?.ReadingTime?.ToString("g") ?? "—")}",
+            $"readingTime    {(snap?.ReadingTime?.ToString("yyyy-MM-dd HH:mm") ?? "—")}",
             // "—" here means the portal never published the field, which is why the
             // low-balance banner stays silent about it.
             $"emergencyCr    {(snap?.EmergencyBalance?.ToString("0.##") ?? "—")}",
@@ -452,7 +471,10 @@ public class ProfilePage : AppPage
             $"daily rows     {snap?.Days.Count ?? 0}",
             $"recharge rows  {snap?.Recharges.Count ?? 0}",
             $"monthly rows   {snap?.Months.Count ?? 0}",
-            $"rate source    {(f == null ? "—" : f.FromUtility ? "utility daily feed" : f.FromMonthly ? "month total ÷ days" : "own readings")}"
+            $"own readings   {Store.Readings(m.Id).Count}",
+            $"rate source    {(f == null ? "—" : f.FromUtility ? "utility daily feed" : f.FromMonthly ? "month total ÷ days" : f.FromRecharges ? "recharge history" : "own readings")}",
+            $"daily rate     {(f?.DailyAvg is { } rate ? rate.ToString("0.00") : "—")}",
+            $"live estimate  {(live is { } v ? "≈ " + v.ToString("0.00") : Forecast.LiveWhyNot)}"
         };
 
         if (m.Utility == Utility.Desco)

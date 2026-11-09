@@ -58,12 +58,20 @@ public class Forecast
     public List<DayRow> Series = new();  // daily spend, oldest → newest
     public bool FromUtility;             // utility gave us a real daily feed
     public bool FromMonthly;             // no daily feed: rate inferred from a monthly total
+    public bool FromRecharges;           // no daily feed, no monthly total: rate inferred from recharge history
     public bool MonthIsPrevious;         // that total was last month's, not this month's
     public string MonthLabel = "";       // yyyy-MM the rate came from
     public List<MonthRow> Months = new();// monthly spend, for the chart
 
     const double Alpha = 0.35;
     const double Vat = 0.05;
+
+    /// <summary>
+    /// How far back the recharge-history rate looks. Long enough that the unknown balance
+    /// at the start of the window is small next to the energy bought inside it; short
+    /// enough that last winter doesn't set this summer's rate.
+    /// </summary>
+    const int RechargeWindowDays = 120;
 
     /// <summary>
     /// The fraction of a payment that reaches the meter as energy, once per-unit charges
@@ -162,10 +170,30 @@ public class Forecast
                 }
             }
 
+            double rate = 0;
             if (monthTaka > 0 && divisor >= 1)
             {
-                var rate = monthTaka / divisor;
+                rate = monthTaka / divisor;
                 f.FromMonthly = true;
+                f.Confidence = 0.35;
+            }
+            else if (RateFromRecharges(snap) is { } fromRecharges)
+            {
+                // DESCO's new portal publishes no daily feed, no monthly history and no
+                // month-to-date figure, so until three distinct meter reads have been
+                // banked there was NO rate at all — DailyAvg stayed null, and with it the
+                // days-left pill, the suggestion and the live-estimate chip. The recharge
+                // history is already downloaded and, over a few months, the energy bought
+                // is the energy used. Rougher than a real feed, hence the lower confidence;
+                // the own-readings path takes over automatically once it has data.
+                rate = fromRecharges;
+                f.FromRecharges = true;
+                f.MonthLabel = "";
+                f.Confidence = 0.25;
+            }
+
+            if (rate > 0)
+            {
                 f.DailyAvg = rate;
                 f.SimpleAvg = rate;
                 // No daily-level shape to separate quiet from active days when we're
@@ -174,22 +202,19 @@ public class Forecast
                 f.WeeklyCost = rate * 7;
                 // Today stays NULL. A monthly total divided by elapsed days says nothing
                 // about today in particular.
-                f.Confidence = 0.35;
                 FillMonth(f, rate, snap);
 
-                if (rate > 0)
+                if (balKnown)
                 {
-                    if (balKnown)
-                    {
-                        // Never below zero. A meter on emergency credit divides a
-                        // NEGATIVE balance by the daily rate and used to report
-                        // "-1 days left", which is not a thing: you have no days.
-                        f.DaysLeft = Math.Max(0, f.Balance / rate);
-                        f.RunsOut = DateTime.Now.AddDays(f.DaysLeft.Value);
-                    }
-                    var need = rate * Store.TargetDays - (balKnown ? f.Balance : 0);
-                    f.SuggestedRecharge = Suggest(need, snap);
+                    // Never below zero. A meter on emergency credit divides a
+                    // NEGATIVE balance by the daily rate and used to report
+                    // "-1 days left", which is not a thing: you have no days.
+                    f.DaysLeft = Math.Max(0, f.Balance / rate);
+                    f.RunsOut = DateTime.Now.AddDays(f.DaysLeft.Value);
                 }
+                var need = rate * Store.TargetDays - (balKnown ? f.Balance : 0);
+                f.SuggestedRecharge = Suggest(need, snap);
+
                 if (Store.Tariff is > 0) f.UnitsPerDay = rate / Store.Tariff.Value;
 
                 f.MonthRecharged = MonthPaid(snap, thisMonth);
@@ -281,6 +306,45 @@ public class Forecast
         }
 
         return f;
+    }
+
+    /// <summary>
+    /// A daily rate from recharge history alone, for when there is no daily feed, no
+    /// monthly total and not yet enough of our own readings — DESCO's new portal, for
+    /// the first few days after adding a meter.
+    ///
+    /// Energy credited by every recharge EXCEPT the newest, divided by the days from the
+    /// oldest recharge to the newest. The newest is excluded because its energy is still
+    /// mostly sitting on the meter; what was bought before it has been used up by the time
+    /// it was needed. That holds when the user tops up at roughly the same balance each
+    /// time — over a 120-day window, any difference is small next to the energy inside it.
+    ///
+    /// energyAmount already excludes the demand charge, which is not consumption.
+    /// Failed rows are left out: one that silently landed makes this a slight
+    /// underestimate, which only delays the low-balance pill, never invents one.
+    /// </summary>
+    internal static double? RateFromRecharges(Snapshot? snap)
+    {
+        if (snap is not { Recharges.Count: > 0 }) return null;
+
+        var cutoff = DateTime.Now.AddDays(-RechargeWindowDays).ToString("yyyy-MM-dd");
+        var rows = snap.Recharges
+            .Where(r => r.Success && !r.MultiToken && r.Amount > 0
+                        && string.CompareOrdinal(r.Date, cutoff) >= 0)
+            .OrderBy(r => r.Date, StringComparer.Ordinal)
+            .ToList();
+
+        if (rows.Count < 3) return null;
+
+        var span = (Date(rows[^1].Date) - Date(rows[0].Date)).TotalDays;
+        if (span < 14) return null;
+
+        var ratio = CreditRatio(snap);
+        var energy = rows.Take(rows.Count - 1)
+                         .Sum(r => r.EnergyAmount > 0 ? r.EnergyAmount : r.Amount * ratio);
+
+        var rate = energy / span;
+        return rate > 0 ? rate : null;
     }
 
     /// <summary>
@@ -501,6 +565,19 @@ public class Forecast
     }
 
     /// <summary>
+    /// Why the last <see cref="LiveEstimate"/> call hid the chip, or "shown". Diagnostics
+    /// only — every early return used to be silent, which made "the chip is missing"
+    /// impossible to debug on a device.
+    /// </summary>
+    public static string LiveWhyNot { get; private set; } = "";
+
+    static double? Hide(string why)
+    {
+        LiveWhyNot = why;
+        return null;
+    }
+
+    /// <summary>
     /// A live estimate of the balance "right now", between once-a-day meter reads.
     /// Answers the question the big number can't when the portal is 12–36 hours behind
     /// wall-clock: "roughly, what have I got at this moment?"
@@ -533,14 +610,16 @@ public class Forecast
     /// </summary>
     public static double? LiveEstimate(Snapshot? snap, Forecast? f, string meterId = "")
     {
-        if (snap is null or { BalanceReported: false }) return null;
-        if (f?.DailyAvg is not (> 0)) return null;
-        if (snap.ReadingTime is not { } readAt) return null;
+        if (snap is null) return Hide("no snapshot");
+        if (!snap.BalanceReported) return Hide("portal reported no balance");
+        if (f?.DailyAvg is not (> 0)) return Hide("no usage rate yet");
+        if (snap.ReadingTime is not { } readAt) return Hide("portal gave no reading time");
 
         var elapsedHours = (DateTime.Now - readAt).TotalHours;
         // Under ~6 hours the measured figure IS the fresh answer. Also catches clock
-        // skew (future ReadingTime → negative elapsed → still < 6).
-        if (elapsedHours < 6) return null;
+        // skew (future ReadingTime → negative elapsed).
+        if (elapsedHours < 0) return Hide($"reading time is in the future ({readAt:yyyy-MM-dd HH:mm})");
+        if (elapsedHours < 6) return Hide($"reading is fresh ({elapsedHours:0.0} h old; chip shows after 6 h)");
 
         var ewma = f.DailyAvg.Value;
         var rate = ewma;
@@ -558,14 +637,14 @@ public class Forecast
             var lastThree = priorDays.TakeLast(3).ToList();
             var quietCount = lastThree.Count(d => d.Taka < quietBar);
 
-            if (quietCount >= 2) return null;                     // vacation regime
+            if (quietCount >= 2) return Hide($"vacation pattern ({quietCount} of last 3 days quiet)");
             if (quietCount == 1) rate = ewma;                     // one-off; long-run rate
             else rate = 0.7 * priorDays[^1].Taka + 0.3 * ewma;    // normal; blend toward yesterday
         }
         else if (priorDays.Count > 0)
         {
             var recent = priorDays[^1].Taka;
-            if (recent < quietBar) return null;
+            if (recent < quietBar) return Hide("yesterday was quiet");
             rate = 0.7 * recent + 0.3 * ewma;
         }
 
@@ -592,6 +671,8 @@ public class Forecast
         // this window only until the read dated D+1 lands, at which point it falls BEHIND
         // readDate and drops out whether it landed or not.
         if (meterId.Length > 0) pending += Reconcile.UnverifiedCredit(meterId, snap);
+
+        LiveWhyNot = "shown";
 
         // Return regardless of sign — a negative estimate is meaningful information
         // (emergency credit deepening), not noise. The renderer colours the chip by sign.
