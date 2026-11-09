@@ -16,6 +16,7 @@ using System.Security.Cryptography;
 using Path = Microsoft.Maui.Controls.Shapes.Path;
 // iOSSpecific also defines a ScrollView (platform-config statics); alias the control.
 using ScrollView = Microsoft.Maui.Controls.ScrollView;
+using Color = Microsoft.Maui.Graphics.Color;
 
 namespace PrepaidTracker;
 

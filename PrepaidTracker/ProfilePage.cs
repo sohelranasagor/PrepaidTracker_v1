@@ -2,6 +2,7 @@ using Microsoft.Maui;
 using Microsoft.Maui.ApplicationModel.DataTransfer;
 using Microsoft.Maui.Controls;
 using Microsoft.Maui.Graphics;
+using Color = Microsoft.Maui.Graphics.Color;
 using System;
 using System.Drawing;
 using System.Globalization;
