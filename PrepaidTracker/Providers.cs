@@ -136,6 +136,14 @@ public class DescoProvider : IProvider
         var api = DescoApi.For(account);
         var snap = new Snapshot { SyncedAt = DateTime.Now };
 
+        // Snapshot.BalanceReported DEFAULTS TO TRUE, and on this portal a balance has to
+        // be earned: it arrives only from a successful realtime POST, or by carrying a
+        // previous reading forward. Leaving the default in place reports a phantom
+        // ৳0.00 — which reads as an empty meter, trips the low-balance banner, and would
+        // fire a notification off a number that never existed. Exactly what this flag
+        // exists to prevent.
+        snap.BalanceReported = false;
+
         // ---- resolve the internal accountId -----------------------------------
         // Every data endpoint hangs off this, NOT off the account number the customer
         // knows: /api/accounts/15539/summary works, /api/accounts/41392222/summary
@@ -149,10 +157,17 @@ public class DescoProvider : IProvider
         {
             // Either the session is gone or the account isn't linked to this login. Both
             // need the user; neither is retryable on its own.
-            LastState = SessionState.NeedsLogin;
+            LastState = api.LastKnownState == SessionState.Ok
+                ? SessionState.NeedsLogin
+                : api.LastKnownState;
             Log("accounts", "no accountId for " + account);
             ProbeLog = string.Join("\n", _log);
-            return new FetchResult { Error = L.S("authExpiredBody") };
+            return new FetchResult
+            {
+                Error = LastState == SessionState.Misconfigured
+                    ? L.S("authPortalChanged")
+                    : L.S("authExpiredBody")
+            };
         }
 
         var root = Wire.Acct(id);
@@ -185,7 +200,7 @@ public class DescoProvider : IProvider
             snap.Address = FirstString(sum.Value, "installationAddress");
             snap.MeterNo = FirstString(sum.Value, "meterNo");
             // Reported as a STRING ("4"), not a number, so FirstOf's Providers.Num
-            // fallback is doing the work here.
+            // fallback is what actually parses it.
             snap.SanctionLoadKw = FirstOf(sum.Value, "sanctionLoad", "sanctionedLoad");
             Log("summary", "ok");
         }
@@ -198,24 +213,26 @@ public class DescoProvider : IProvider
         // exactly what an app that syncs on every open would do.
         //
         // So: only on an explicit user refresh, and only when the stored snapshot says
-        // we are past nextEligibleAt. Every other sync keeps the balance we already have,
+        // we are past nextEligibleAt. Every other sync keeps the reading we already have,
         // which is correct — if today's read already succeeded, the stored figure IS
         // today's reading.
         var meterId = Store.Meters().FirstOrDefault(m =>
             string.Equals(m.Account.Trim(), account.Trim(), StringComparison.OrdinalIgnoreCase))?.Id ?? "";
         var prior = meterId.Length > 0 ? Store.Snapshot(meterId) : null;
 
-        // Carry the previous reading forward by default. A sync that doesn't ask for a
-        // new read must not blank the balance the user is looking at.
+        // Carry the previous reading forward. A sync that doesn't ask for a new read
+        // must not blank the balance the user is looking at.
         if (prior is { BalanceReported: true })
         {
             snap.Balance = prior.Balance;
             snap.BalanceReported = true;
             snap.ReadingTime = prior.ReadingTime;
-            snap.NextEligible = prior.NextEligible;
         }
+        // Carried separately from the balance: the quota applies even when we have never
+        // managed to read one, and losing it would unlock the refresh button early.
+        snap.NextEligible = prior?.NextEligible;
 
-        var eligible = prior?.NextEligible is not { } next || DateTime.Now >= next;
+        var eligible = snap.NextEligible is not { } next || DateTime.Now >= next;
 
         if (UserRequestedFresh && eligible)
         {
@@ -227,32 +244,39 @@ public class DescoProvider : IProvider
                 var row = rt.Value;
                 var status = FirstString(row, "status");
 
-                // Their own wording: ALREADY_SUCCEEDED_TODAY means today's read happened,
-                // so whatever we hold IS current. Record when we may ask again and leave
-                // the stored balance alone.
-                snap.NextEligible = ParseIso(FirstString(row, "nextEligibleAt")) ?? snap.NextEligible;
+                // Recorded whether the call succeeded or was refused — a refusal is the
+                // ONLY place the portal tells us when we may ask again.
+                if (ParseIso(FirstString(row, "nextEligibleAt")) is { } n) snap.NextEligible = n;
 
-                var balText = FirstString(row, "balance", "lastRealtimeBalance", "remainingBalance");
+                // UNVERIFIED field name: every probe so far has hit the daily limit, so
+                // a SUCCESSFUL response has never been seen. Three candidates, in order
+                // of likelihood. If the balance stays blank after a successful refresh,
+                // this is the line to fix — check Profile → Diagnostics, which logs the
+                // status the portal returned.
+                var balText = FirstString(row, "balance", "lastRealtimeBalance",
+                                               "remainingBalance", "currentBalance");
                 if (balText.Length > 0)
                 {
                     snap.Balance = Providers.Num(balText);
                     snap.BalanceReported = true;
                     snap.ReadingTime = ParseIso(FirstString(row, "readingTime", "receivedAt",
-                                                                "lastRealtimeReceivedAt"))
+                                                                    "lastRealtimeReceivedAt"))
                                            ?? DateTime.Now;
                     Log("realtime", "fresh read ok");
                 }
                 else
                 {
-                    Log("realtime", status.Length > 0 ? status : "no balance field");
+                    // ALREADY_SUCCEEDED_TODAY means today's read has happened, so the
+                    // figure we already hold IS current. Not an error.
+                    Log("realtime", status.Length > 0 ? status : "200, no balance field");
                 }
             }
             else Log("realtime", "POST failed");
         }
         else if (UserRequestedFresh)
-            Log("realtime", "quota: not eligible until " + (prior?.NextEligible?.ToString("g") ?? "?"));
+            Log("realtime", "quota: not eligible until " + (snap.NextEligible?.ToString("g") ?? "?"));
         else
-            Log("realtime", "cached (no fresh read requested)");
+            Log("realtime", snap.BalanceReported ? "cached reading" : "no reading yet");
 
         // ---- transactions -------------------------------------------------------
         var from = DateTime.Now.AddDays(-365).ToString("yyyy-MM-dd");
@@ -271,9 +295,9 @@ public class DescoProvider : IProvider
 
                 // The portal's own spelling, typo included: "Execution Successful" or
                 // "Not Returnd". Anything that isn't the success string is treated as a
-                // failure, which is the safe direction — a row wrongly called failed
-                // gets settled by the next meter read, whereas one wrongly called
-                // successful silently inflates the day's usage.
+                // failure, which is the safe direction — a row wrongly called failed gets
+                // settled by the next meter read, whereas one wrongly called successful
+                // silently inflates the day's usage.
                 var orderStatus = FirstString(r, "orderStatus", "status");
                 var success = orderStatus.Equals("Execution Successful", StringComparison.OrdinalIgnoreCase);
 
@@ -307,11 +331,11 @@ public class DescoProvider : IProvider
         snap.Recharges = snap.Recharges.OrderBy(r => r.Date, StringComparer.Ordinal).ToList();
 
         // ---- what this portal does NOT give us ----------------------------------
-        // No monthly endpoint has been found (the dashboard itself says "No monthly data
-        // yet" for this account), and no daily-consumption endpoint either. So Months
-        // and Days both stay empty, and Forecast falls through to its own-readings path:
-        // the app derives the daily series from consecutive balance readings, which needs
-        // three distinct meter reads before the first bar appears.
+        // No monthly endpoint (/monthly, /monthly-consumption, /consumption, /usage all
+        // 404) and no daily one either. Months and Days both stay empty, so Forecast
+        // falls through to its own-readings path: the daily series is derived from
+        // consecutive balance readings, which needs three distinct reads before the
+        // first bar appears. At one read a day, that is three days.
         //
         // There is also no month-to-date figure anywhere in this API — the old
         // getBalance.currentMonthConsumption has no equivalent — so
