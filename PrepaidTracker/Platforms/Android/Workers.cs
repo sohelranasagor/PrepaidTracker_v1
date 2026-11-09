@@ -1,5 +1,6 @@
 using Android.Content;
 using AndroidX.Work;
+using System;
 
 namespace PrepaidTracker;
 
@@ -28,8 +29,22 @@ public class SyncWorker : Worker
         {
             // Worker.DoWork is already off the main thread; block here deliberately
             // rather than pull in ListenableWorker's future plumbing for one call.
-            var ok = Sync.RunAllAsync().GetAwaiter().GetResult();
-            return ok ? Result.InvokeSuccess() : Result.InvokeRetry();
+            var outcome = Sync.RunAllAsync().GetAwaiter().GetResult();
+
+            return outcome switch
+            {
+                SyncOutcome.Ok => Result.InvokeSuccess(),
+
+                // Mirrors the iOS SetTaskCompleted logic: AuthRequired fetched nothing,
+                // but retrying is pointless until the user signs in — it would just make
+                // WorkManager back off and re-run a sync that cannot succeed. Failure ends
+                // this run cleanly; the periodic net still fires on its next period, and
+                // the one-shot next-read wake is re-armed on the next launch.
+                SyncOutcome.AuthRequired => Result.InvokeFailure(),
+
+                // Anything else (network trouble, portal hiccup) is plausibly transient.
+                _ => Result.InvokeRetry(),
+            };
         }
         catch
         {
