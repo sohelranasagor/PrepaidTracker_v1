@@ -45,8 +45,7 @@ public static class DescoSignIn
         var user = await Modal.Prompt(page.Root, L.S("authTitle"), L.S("authUserHint"));
         if (string.IsNullOrWhiteSpace(user)) return false;
 
-        var pass = await Modal.Prompt(page.Root, L.S("authTitle"), L.S("authPassHint"),
-                                      isPassword: true);
+        var pass = await Modal.Prompt(page.Root, L.S("authTitle"), L.S("authPassHint"));
         if (string.IsNullOrWhiteSpace(pass)) return false;
 
         // A free Render-style cold start isn't in play here — this is DESCO's own
