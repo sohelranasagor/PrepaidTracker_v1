@@ -158,9 +158,13 @@ public static class BackgroundSync
 
         // App-refresh gets ~30 seconds; a processing task gets minutes. Same work either
         // way — Sync.RunAllAsync is the one path the foreground uses too.
-        var any = await Sync.RunAllAsync(false, cts.Token);
+        var outcome = await Sync.RunAllAsync(false, cts.Token);
 
-        task.SetTaskCompleted(any);
+        // SetTaskCompleted(true) tells iOS the wake was productive, which is one of the
+        // signals it uses to decide how often to wake us again. AuthRequired is NOT
+        // productive — nothing was fetched — and reporting it as success would train iOS
+        // to keep waking an app that can't do anything until the user signs in.
+        task.SetTaskCompleted(outcome == SyncOutcome.Ok);
     }
 #else
     public static void Register() { }
