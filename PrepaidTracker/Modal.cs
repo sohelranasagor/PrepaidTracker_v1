@@ -6,6 +6,8 @@ using Microsoft.Maui.Controls.PlatformConfiguration.iOSSpecific;
 using Microsoft.Maui.Controls.Shapes;
 using Microsoft.Maui.Devices;
 using Microsoft.Maui.Graphics;
+using System;
+
 // iOSSpecific also defines a ScrollView (platform-config statics); alias the control.
 using ScrollView = Microsoft.Maui.Controls.ScrollView;
 
@@ -18,7 +20,7 @@ namespace PrepaidTracker;
 /// </summary>
 public abstract class AppPage : ContentPage
 {
-    protected readonly Grid Root = new();
+    public Grid Root { get; }
     string _lastToken = "\u0000";
 
     protected AppPage()

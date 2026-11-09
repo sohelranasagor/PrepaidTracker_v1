@@ -7,7 +7,7 @@ using System;
 using System.Drawing;
 using System.Globalization;
 using System.Reflection;
-using System.Reflection.Emit;
+using Label = Microsoft.Maui.Controls.Label;
 
 namespace PrepaidTracker;
 

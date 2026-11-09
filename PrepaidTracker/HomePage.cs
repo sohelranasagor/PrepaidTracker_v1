@@ -7,16 +7,16 @@ using Microsoft.Maui.Controls.Shapes;
 using Microsoft.Maui.Graphics;
 using Microsoft.Maui.Networking;
 using System;
-using System.Drawing;
 using System.Globalization;
-using System.Reflection;
-using System.Reflection.Emit;
-using System.Security.Cryptography;
 // Implicit usings bring System.IO.Path into scope; we mean the drawable shape.
 using Path = Microsoft.Maui.Controls.Shapes.Path;
 // iOSSpecific also defines a ScrollView (platform-config statics); alias the control.
 using ScrollView = Microsoft.Maui.Controls.ScrollView;
+// System.Drawing is in scope on iOS via implicit usings, so these three names are
+// ambiguous without an alias. Same reason as the two above.
 using Color = Microsoft.Maui.Graphics.Color;
+using Point = Microsoft.Maui.Graphics.Point;
+using Label = Microsoft.Maui.Controls.Label;
 
 namespace PrepaidTracker;
 

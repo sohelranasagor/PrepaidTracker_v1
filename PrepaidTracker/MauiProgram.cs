@@ -33,8 +33,8 @@ public static class MauiProgram
         // SecAccessible.AfterFirstUnlockThisDeviceOnly on the platform SecureStorage
         // implementation. Existing Keychain items keep whatever class they were written
         // with, so users who signed in before this shipped will be asked once more.
-        SecureStorage.Default.DefaultAccessible =
-            Security.SecAccessible.AfterFirstUnlockThisDeviceOnly;
+        if (SecureStorage.Default is SecureStorageImplementation impl)
+            impl.DefaultAccessible = Security.SecAccessible.AfterFirstUnlockThisDeviceOnly;
 #endif
 
         _ = Access.RefreshConfigAsync();

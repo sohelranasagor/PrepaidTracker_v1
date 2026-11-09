@@ -158,7 +158,7 @@ public static class BackgroundSync
 
         // App-refresh gets ~30 seconds; a processing task gets minutes. Same work either
         // way — Sync.RunAllAsync is the one path the foreground uses too.
-        var any = await Sync.RunAllAsync(cts.Token);
+        var any = await Sync.RunAllAsync(false, cts.Token);
 
         task.SetTaskCompleted(any);
     }
