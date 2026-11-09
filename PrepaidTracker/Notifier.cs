@@ -4,6 +4,8 @@ using UserNotifications;
 #endif
 #if ANDROID
 using AndroidX.Work;
+using System.Security.Permissions;
+using static System.Runtime.InteropServices.JavaScript.JSType;
 #endif
 
 namespace PrepaidTracker;
@@ -145,6 +147,51 @@ public static class Notifier
         Show(L.S("tokenAlertTitle"),
              L.S("tokenAlertBody", Lead(meter, accountName), L.N($"{r.Amount:#,0.##}")));
     }
+
+    // ---------------- the session died ----------------
+
+    /// <summary>
+    /// DESCO's rebuilt portal (Nov 2026) requires a login, and a session can expire while
+    /// the app is closed. When that happens there is nothing the app can do alone: the
+    /// stored credential was rejected, so only the user can restore it. Until they do,
+    /// every sync returns nothing and the balance on screen silently ages — which is the
+    /// worst failure this app has, because it looks exactly like everything working.
+    ///
+    /// ONCE A DAY, not once a sync. Android's exact alarm plus WorkManager plus every app
+    /// open can run this many times an hour, and a "sign in again" that repeats is one
+    /// people learn to swipe away without reading.
+    ///
+    /// Deliberately NOT gated by Store.LastAlert. That slot belongs to the low-balance
+    /// nag; burning it here would silence a genuinely urgent alert for the rest of the
+    /// day, and these two say different things. The guard is its own Preferences key.
+    ///
+    /// Not scheduled ahead either, unlike ScheduleLowBalance: a dated reminder would keep
+    /// firing after the user had already signed in, because nothing cancels it from the
+    /// sign-in path. The next failed sync re-raises this one instead, which self-corrects.
+    /// </summary>
+    public static void SessionExpired(Meter meter)
+    {
+        if (!Store.AlertsEnabled || !meter.NotificationsEnabled) return;
+
+        var today = DateTime.Now.ToString("yyyy-MM-dd");
+        var key = "auth-notified-" + meter.Id;
+        if (Preferences.Get(key, "") == today) return;
+
+        Show(L.S("authExpiredTitle"),
+             L.S("authExpiredBody2", Lead(meter, null)));
+
+        // Marked after posting, for the same reason CheckLowBalance does: a suppressed or
+        // OS-denied notification must not burn the day's slot.
+        Preferences.Set(key, today);
+    }
+
+    /// <summary>
+    /// Clear the once-a-day guard so the next failure can speak again. Called from the
+    /// sign-in flow: a user who has just re-authenticated and then hits a second expiry
+    /// the same day should be told, not left wondering why the balance stopped moving.
+    /// </summary>
+    public static void ClearSessionWarning(string meterId) =>
+        Preferences.Remove("auth-notified-" + meterId);
 
     // ---------------- low later: the queued alert ----------------
 
@@ -312,6 +359,9 @@ public static class Notifier
         // that name an account the app no longer holds.
         ClearDeliveredFor(meterId);
         Store.SetScheduledAlerts(meterId, "");
+        // The session warning is keyed per meter too; a deleted account must not have a
+        // stale "sign in again" guard left behind for an id that will never return.
+        ClearSessionWarning(meterId);
     }
 
     /// <summary>
@@ -334,8 +384,8 @@ public static class Notifier
     /// <summary>
     /// Walk the OS's pending and delivered notifications and drop any low-balance alert
     /// whose meter is no longer in the store. This is what stops a renamed or deleted
-    /// account (e.g. A/C 14024778 replaced by 14024780) from continuing to fire under its
-    /// old name for days. Called at startup, so a ghost queue clears itself on next launch.
+    /// account from continuing to fire under its old name for days. Called at startup,
+    /// so a ghost queue clears itself on next launch.
     /// </summary>
     public static void SweepOrphans()
     {
@@ -404,8 +454,7 @@ public static class Notifier
             // same sync post within the same millisecond, and TickCount would hand them the
             // SAME id — the second notification would replace the first and one account's
             // warning would just vanish. The body carries the A/C number, so hashing the text
-            // gives each meter its own notification slot: two accounts show two notifications,
-            // and re-alerting one meter updates its own in place instead of stacking.
+            // gives each meter its own notification slot.
             mgr.Notify(StableId(title + "\u0001" + body), n);
         }
         catch { /* a failed toast must never crash a sync */ }

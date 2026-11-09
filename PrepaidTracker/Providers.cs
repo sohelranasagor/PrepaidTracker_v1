@@ -20,12 +20,15 @@ public interface IProvider
 
 public static class Providers
 {
-    // DESCO's certificate chain is unreliable. Nothing secret is sent — only a
-    // meter number — so a TLS hiccup shouldn't take the whole app down. But the
-    // exception is scoped to DESCO's own hosts: this handler also carries NESCO's
-    // POSTs, and accepting anybody's bad certificate because one utility
-    // misconfigured theirs is a different decision, and not one this app needs.
-    static readonly HttpClient Http = new(new SocketsHttpHandler
+    // DESCO's certificate chain is unreliable. The exception is scoped to DESCO's own
+    // hosts: this handler also carries NESCO's POSTs, and accepting anybody's bad
+    // certificate because one utility misconfigured theirs is a different decision.
+    //
+    // Now `internal` rather than private: DescoApi carries the authenticated session and
+    // must go through this same host-scoped callback. Giving it its own handler with
+    // validation disabled outright would be a real downgrade, because that connection
+    // now carries a PASSWORD, not just a meter number.
+    internal static readonly HttpClient Http = new(new SocketsHttpHandler
     {
         SslOptions = new System.Net.Security.SslClientAuthenticationOptions
         {
@@ -69,408 +72,306 @@ public static class Providers
 }
 
 // ---------------------------------------------------------------------------
-// DESCO — unauthenticated JSON API.
-// getBalance / getCustomerInfo / getRechargeHistory / getCustomerMonthlyConsumption
-// are confirmed. Daily BDT consumption exists too (it's what powers a 7-day chart
-// on day one) but the endpoint name isn't documented publicly, so we probe a short
-// list of candidates and remember whichever answers.
+// DESCO — authenticated session API (new portal, November 2026).
+//
+// The old unauthenticated api/tkdes/customer/* family is gone. DESCO rebuilt the
+// portal with a login — their own notice says authentication was added to protect
+// customer data — so every call now rides a session cookie obtained by DescoApi.
+//
+// Endpoints, as observed on the new portal:
+//
+//   realtime-balance   balance + the live-read quota state
+//   summary            month-to-date, sanction load, customer details
+//   monthly            finished months
+//   transactions       recharges, with energyAmount, demandCharge and STS tokens
+//
+// Three facts shape everything below:
+//
+//   1. LIVE READS ARE RATIONED — roughly one a day, after which the portal answers
+//      status DAILY_LIMIT_REACHED and names a nextEligibleAt. So an ordinary sync
+//      NEVER requests a fresh read: it uses lastRealtimeBalance, which is free and is
+//      the same midnight-snapshot figure the old getBalance returned. Only an explicit
+//      user refresh spends an attempt, and only once nextEligibleAt has passed. The old
+//      "sync on every app open" habit would exhaust the day's allowance before noon.
+//
+//   2. THEIR OWN /balance ENDPOINT 404s on UNIFIED meters — their portal renders "The
+//      requested resource was not found" in its own UI. We don't call it.
+//
+//   3. NO DAILY FEED has been located on the new portal. Snapshot.Days therefore stays
+//      empty and Forecast falls through to the monthly total, then to our own readings.
+//      At ~1 read/day that needs three syncs before the first derived bar appears.
 // ---------------------------------------------------------------------------
 public class DescoProvider : IProvider
 {
-    const string Tkdes = "https://prepaid.desco.org.bd/api/tkdes/customer";
-    const string Unified = "https://prepaid.desco.org.bd/api/unified/customer";
+    /// <summary>
+    /// Why the last fetch failed, when it failed for session reasons. NeedsLogin is the
+    /// one the caller must act on: only the user can fix it, and Sync must not bank a
+    /// reading or run Reconcile off a fetch that never happened.
+    /// </summary>
+    public SessionState LastState { get; private set; } = SessionState.Ok;
 
-    static readonly string[] BalanceEndpoints = { $"{Tkdes}/getBalance", $"{Unified}/getBalance" };
-    static readonly string[] InfoEndpoints = { $"{Tkdes}/getCustomerInfo", $"{Unified}/getCustomerInfo" };
+    /// <summary>
+    /// Request a fresh meter read this sync, spending one of the day's rationed reads.
+    /// Set by the pull-to-refresh path only; every background caller leaves it false.
+    /// Carried on the instance rather than the call because IProvider's signature is
+    /// shared with NescoProvider and changing it would ripple through every call site.
+    /// </summary>
+    public bool UserRequestedFresh { get; set; }
 
-    static readonly string[] RechargeEndpoints =
-    {
-        $"{Tkdes}/getRechargeHistory",
-        $"{Unified}/getRechargeHistory",
-        $"{Tkdes}/getCustomerRechargeHistory"
-    };
-
-    static readonly string[] MonthlyEndpoints =
-    {
-        $"{Tkdes}/getCustomerMonthlyConsumption",
-        $"{Unified}/getCustomerMonthlyConsumption",
-        $"{Tkdes}/getMonthlyConsumption"
-    };
-
-    static readonly string[] DailyEndpoints =
-    {
-        $"{Tkdes}/getCustomerDailyConsumption",
-        $"{Unified}/getCustomerDailyConsumption",
-        $"{Tkdes}/getCustomerDailyConsumptionInfo",
-        $"{Tkdes}/getDailyConsumption",
-        $"{Unified}/getDailyConsumption"
-    };
-
-    static string? _knownBalance, _knownRecharge, _knownMonthly, _knownDaily;
-    static bool _warmed;   // portal page fetched once this run, for cookies + reachability
-
-    /// <summary>What answered last sync, for Profile → Diagnostics.</summary>
-    public static string BalanceEndpointUsed => Short(_knownBalance);
-    public static string RechargeEndpointUsed => Short(_knownRecharge);
-    public static string MonthlyEndpointUsed => Short(_knownMonthly);
-    public static string DailyEndpointUsed => Short(_knownDaily);
+    /// <summary>What happened last sync, for Profile → Diagnostics.</summary>
     public static string ProbeLog { get; private set; } = "";
-    static string Short(string? url) => url == null ? "none" : url[(url.LastIndexOf('/') + 1)..];
 
     readonly HttpClient _http;
     readonly List<string> _log = new();
+
     public DescoProvider(HttpClient http) => _http = http;
+
+    void Log(string what, string outcome) => _log.Add($"{what,-24} {outcome}");
 
     public async Task<FetchResult> FetchAsync(string account, CancellationToken ct = default)
     {
-        var acct = Uri.EscapeDataString(account);
-        var snap = new Snapshot { SyncedAt = DateTime.Now };
         _log.Clear();
+        LastState = SessionState.Ok;
 
-        // Load the portal page once per run: it sets any cookies the API expects,
-        // and its status code tells us immediately if DESCO is unreachable or
-        // blocking us outright.
-        if (!_warmed)
-        {
-            try
-            {
-                using var res = await _http.GetAsync("https://prepaid.desco.org.bd/customer/", ct);
-                Log("warmup", $"HTTP {(int)res.StatusCode}");
-            }
-            catch (Exception e) { Log("warmup", $"{e.GetType().Name}: {Snip(e.InnerException?.Message ?? e.Message)}"); }
-            _warmed = true;
-        }
+        var api = DescoApi.For(account);
+        var snap = new Snapshot { SyncedAt = DateTime.Now };
 
-        // ---- customer info FIRST: it answers with accountNo alone and gives us
-        //      the meterNo, which the unified endpoints need alongside accountNo.
-        //      (The official portal always sends both.) The portal also accepts
-        //      logging in BY meter number, so if accountNo finds nothing, retry
-        //      treating what the user typed as a meter number. ----
-        var meterNo = "";
-        var infoQueries = new[] { $"accountNo={acct}", $"meterNo={acct}" };
-        foreach (var q in infoQueries)
+        // ---- balance + quota state --------------------------------------------
+        // This call ALONE decides the session verdict. A 401 on a secondary endpoint
+        // later must not throw away a balance we already hold: an earlier design hung
+        // the state off the provider and let whichever endpoint ran last overwrite it,
+        // so a good reading was discarded because the monthly feed expired mid-sync.
+        var (rt, st) = await api.GetAsync(Wire.PathRealtime, ct);
+        if (st != SessionState.Ok)
         {
-            foreach (var ep in Order(InfoEndpoints, null))
+            LastState = st;
+            Log("realtime-balance", st.ToString());
+            ProbeLog = string.Join("\n", _log);
+            return new FetchResult
             {
-                var info = await TryGet($"{ep}?{q}", ct);
-                if (info is not { ValueKind: JsonValueKind.Object }) { Log(ep, "no info"); continue; }
-                snap.CustomerName = Str(info.Value, "customerName");
-                snap.Address = Str(info.Value, "installationAddress");
-                meterNo = FirstString(info.Value, "meterNo", "meterNumber");
-                var accountFound = FirstString(info.Value, "accountNo", "accountNumber");
-                if (accountFound.Length > 0) acct = Uri.EscapeDataString(accountFound);
-                if (snap.CustomerName.Length > 0 || meterNo.Length > 0) { Log(ep, "ok"); break; }
-            }
-            if (snap.CustomerName.Length > 0 || meterNo.Length > 0) break;
-        }
-        var pair = meterNo.Length > 0
-            ? $"accountNo={acct}&meterNo={Uri.EscapeDataString(meterNo)}"
-            : $"accountNo={acct}";
-
-        // ---- balance ----
-        // A balance of exactly 0.00 (or negative, during friendly hours) is a
-        // valid answer — accept any response that HAS a balance-ish field. And
-        // crucially: DESCO's unified (smart-meter) accounts often return valid
-        // JSON with NO balance at all — their own portal shows those accounts
-        // without a remaining-balance figure. That's not a reason to throw away
-        // the recharge history and consumption we CAN get, so a missing balance
-        // no longer aborts the sync.
-        var balanceNames = new[] { "balance", "remainingBalance", "currentBalance", "balanceAmount" };
-        var balQueries = meterNo.Length > 0
-            ? new[] { pair }
-            : new[] { pair, $"meterNo={acct}" };
-        JsonElement? bal = null;
-        string? balField = null;
-        foreach (var q in balQueries)
-        {
-            foreach (var ep in Order(BalanceEndpoints, _knownBalance))
-            {
-                bal = await TryGet($"{ep}?{q}", ct);
-                if (bal is { ValueKind: JsonValueKind.Object })
+                Error = st switch
                 {
-                    balField = balanceNames.FirstOrDefault(n => HasField(bal.Value, n));
-                    if (balField != null) { _knownBalance = ep; Log(ep, "ok"); break; }
-                    Log(ep, "no balance; keys: " + Snip(string.Join(",", FieldNames(bal.Value))));
+                    SessionState.NeedsLogin => L.S("authExpiredBody"),
+                    SessionState.Misconfigured => L.S("authPortalChanged"),
+                    _ => L.S("authUnreachable")
                 }
-                else Log(ep, "no balance");
-                bal = null;
+            };
+        }
+
+        var row = rt is null ? null : PickMeter(rt.Value, account);
+        if (row is null)
+        {
+            Log("realtime-balance", rt is null ? "no data" : "no meter row");
+            ProbeLog = string.Join("\n", _log);
+            return new FetchResult { Error = "No data returned.\n\n" + ProbeLog };
+        }
+
+        var status = FirstString(row.Value, "status");
+        var nextOk = ParseIso(FirstString(row.Value, "nextEligibleAt"));
+        var lastAt = ParseIso(FirstString(row.Value, "lastRealtimeReceivedAt", "readingTime"));
+
+        // Spend a rationed read only when the user asked AND it can actually succeed.
+        // Note the portal's own fields disagree under DAILY_LIMIT_REACHED (it reported
+        // attemptsToday 1 with remainingAttempts 2 while refusing), so `status` and
+        // `nextEligibleAt` are the sources of truth and remainingAttempts is ignored.
+        if (UserRequestedFresh
+            && !status.Equals("DAILY_LIMIT_REACHED", StringComparison.OrdinalIgnoreCase)
+            && (nextOk is null || DateTime.Now >= nextOk))
+        {
+            var (fresh, fs) = await api.GetAsync(Wire.PathRealtime + Wire.RefreshQuery, ct);
+            if (fs != SessionState.Ok)
+            {
+                LastState = fs;
+                Log("realtime-refresh", fs.ToString());
             }
-            if (bal != null) break;
+            else if (fresh is not null && PickMeter(fresh.Value, account) is { } fr)
+            {
+                row = fr;
+                nextOk = ParseIso(FirstString(fr, "nextEligibleAt"));
+                lastAt = ParseIso(FirstString(fr, "lastRealtimeReceivedAt", "readingTime"));
+                Log("realtime-refresh", "fresh read spent");
+            }
         }
+        else if (UserRequestedFresh)
+            Log("realtime-refresh", $"skipped: {(status.Length > 0 ? status : "not yet eligible")}");
 
-        if (bal != null && balField != null)
-        {
-            snap.Balance = Dbl(bal.Value, balField);
-            snap.BalanceReported = true;
-            if (snap.MeterNo.Length == 0) snap.MeterNo = Str(bal.Value, "meterNo");
-            snap.CurrentMonthConsumption = Dbl(bal.Value, "currentMonthConsumption");
-            snap.ReadingTime = ParseTime(Str(bal.Value, "readingTime"));
-        }
-        else
-        {
-            snap.Balance = 0;
-            snap.BalanceReported = false;
-        }
-        if (snap.MeterNo.Length == 0) snap.MeterNo = meterNo;
+        // A balance of 0.00, or a negative one (emergency credit), is a valid and
+        // urgent answer. The question is whether the portal gave us the FIELD.
+        var balText = FirstString(row.Value, "lastRealtimeBalance", "balance", "remainingBalance");
+        snap.BalanceReported = balText.Length > 0;
+        snap.Balance = snap.BalanceReported ? Providers.Num(balText) : 0;
+        snap.MeterNo = FirstString(row.Value, "meterNo");
 
-        // ---- recharge history ----
+        // lastRealtimeReceivedAt is UTC with a Z suffix ("2026-11-09T03:05:02.976Z" =
+        // 09:05 Dhaka, which is what the portal's own UI shows). ParseIso converts; do
+        // NOT substitute the sync time, which would imply a liveness the data lacks.
+        snap.ReadingTime = lastAt;
+        snap.NextEligible = nextOk;
+        Log("realtime-balance", snap.BalanceReported ? "ok" : "no balance");
+
+        // ---- summary: month-to-date, sanction load, customer -------------------
+        var (sum, _) = await api.GetAsync(Wire.PathSummary, ct);
+        if (sum is not null)
+        {
+            snap.CurrentMonthConsumption =
+                FirstOf(sum.Value, "currentMonthConsumption", "monthToDate", "consumedTaka");
+            snap.SanctionLoadKw = FirstOf(sum.Value, "sanctionLoad", "sanctionedLoad", "loadKw");
+            snap.CustomerName = FirstString(sum.Value, "customerName", "name");
+            snap.Address = FirstString(sum.Value, "installationAddress", "address");
+            snap.MinRecharge = Positive(FirstOf(sum.Value, "minRecharge", "minimumRecharge"));
+            snap.EmergencyBalance = Positive(FirstOf(sum.Value, "emergencyBalance", "emergencyCredit"));
+            Log("summary", "ok");
+        }
+        else Log("summary", "no data");
+
+        // ---- monthly consumption ----------------------------------------------
+        var monthFrom = DateTime.Now.AddMonths(-11).ToString("yyyy-MM");
+        var monthTo = DateTime.Now.ToString("yyyy-MM");
+        var (mon, _) = await api.GetAsync($"{Wire.PathMonthly}?monthFrom={monthFrom}&monthTo={monthTo}", ct);
+        if (mon is not null)
+        {
+            // Parse and validate before accepting: rows whose month string is shorter
+            // than "yyyy-MM" are dropped downstream, and counting raw rows left Months
+            // empty with nothing left to try.
+            var parsed = AsArray(mon).Select(m => new MonthRow
+            {
+                Month = FirstString(m, "month", "yearMonth", "monthName", "period"),
+                Taka = FirstOf(m, "consumedTaka", "amount", "taka"),
+                Units = FirstOf(m, "consumedUnit", "unit", "kwh")
+            }).Where(m => m.Month.Length >= 7).ToList();
+
+            snap.Months.AddRange(parsed);
+            Log("monthly", parsed.Count > 0 ? $"{parsed.Count} rows" : "0 rows");
+        }
+        else Log("monthly", "no data");
+
+        // ---- transactions ------------------------------------------------------
         var from = DateTime.Now.AddDays(-365).ToString("yyyy-MM-dd");
         var to = DateTime.Now.ToString("yyyy-MM-dd");
-        foreach (var ep in Order(RechargeEndpoints, _knownRecharge))
+        var (txn, _) = await api.GetAsync($"{Wire.PathTxns}?dateFrom={from}&dateTo={to}", ct);
+        if (txn is not null)
         {
-            var rc = await TryGet($"{ep}?{pair}&dateFrom={from}&dateTo={to}", ct);
-            var rows = AsArray(rc).ToList();
-            if (rows.Count == 0) { Log(ep, "0 rows"); continue; }
-
-            foreach (var r in rows)
+            foreach (var r in AsArray(txn))
             {
-                var raw = FirstString(r, "rechargeDate", "date", "rechargeTime");
+                var raw = FirstString(r, "rechargeDate", "date");
                 if (raw.Length < 10) continue;
-                var amount = FirstOf(r, "totalAmount", "rechargeAmount", "amount", "energyAmount");
+
+                var amount = FirstOf(r, "totalAmount", "amount");
                 if (amount <= 0) continue;
 
-                // DESCO reports a status too ("Execution Successful" / "Not Returnd" /
-                // "Cancelled"); hard-coding Success=true made failed recharges look
-                // fine in the app while the portal showed them failed.
-                var status = FirstString(r, "rechargeStatus", "executionStatus", "orderStatus", "status");
-                var success = status.Length == 0
-                    || !Regex.IsMatch(status, @"fail|not\s*return|cancel|reject|revok|pending|unsuccess", RegexOptions.IgnoreCase);
+                // The portal's own spelling, typo included: "Execution Successful"
+                // or "Not Returnd". Anything that isn't the success string is a
+                // failure, which is the safe direction — a row wrongly treated as
+                // failed gets settled by the next read; one wrongly treated as
+                // successful silently inflates the day's usage.
+                var orderStatus = FirstString(r, "orderStatus", "status");
+                var success = orderStatus.Equals("Execution Successful", StringComparison.OrdinalIgnoreCase);
+
+                // A meter key-change arrives as ONE transaction carrying a SET of
+                // tokens (sequence "-3~9", twelve of them). Reconcile must not try to
+                // settle that against a single balance rise — see CreditState.Informational.
+                var tokens = FirstString(r, "token")
+                    .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
 
                 snap.Recharges.Add(new RechargeRow
                 {
                     Date = raw[..10],
                     Time = raw.Length >= 16 ? raw.Substring(11, 5) : "",
                     Amount = amount,
+                    // energyAmount already EXCLUDES the demand charge: 600 → 574.27 with
+                    // none, 400 → 214.85 with ৳168 of it. Verified across 24 recharges.
                     EnergyAmount = FirstOf(r, "energyAmount", "energy"),
-                    // No orderNo here: a 20-digit order number is not an operator.
-                    Via = FirstString(r, "rechargeOperator", "operator", "channel", "rechargeBy").ToUpperInvariant(),
+                    DemandCharge = FirstOf(r, "demandCharge"),
+                    OrderId = FirstString(r, "orderId"),
+                    Via = FirstString(r, "rechargeOperator", "operator", "channel").ToUpperInvariant(),
                     Success = success,
+                    Tokens = tokens,
+                    MultiToken = tokens.Length > 1,
                     Details = AllFields(r)
                 });
             }
-            if (snap.Recharges.Count > 0) { _knownRecharge = ep; Log(ep, $"{snap.Recharges.Count} rows"); break; }
-            Log(ep, "rows unparsed");
+            Log("transactions", $"{snap.Recharges.Count} rows");
         }
+        else Log("transactions", "no data");
+
         snap.Recharges = snap.Recharges.OrderBy(r => r.Date, StringComparer.Ordinal).ToList();
 
-        // ---- daily consumption: what makes a 7-day chart possible immediately ----
-        // The window ends YESTERDAY. DESCO posts a day's figure once the day closes, and
-        // a working public dashboard that reads this same endpoint deliberately requests
-        // yesterday-back-30 rather than including today. A today-ended range is kept as a
-        // second attempt for meters that do serve it.
-        var yesterday = DateTime.Now.AddDays(-1);
-        string[] dayRanges =
-        {
-            $"dateFrom={yesterday.AddDays(-39):yyyy-MM-dd}&dateTo={yesterday:yyyy-MM-dd}",
-            $"dateFrom={DateTime.Now.AddDays(-40):yyyy-MM-dd}&dateTo={to}"
-        };
-
-        foreach (var ep in Order(DailyEndpoints, _knownDaily))
-        {
-            foreach (var range in dayRanges)
-            {
-                var daily = await TryGet($"{ep}?{pair}&{range}", ct);
-                var rows = AsArray(daily).ToList();
-                if (rows.Count == 0) { Log(ep, $"0 rows (to {range[(range.LastIndexOf('=') + 1)..]})"); continue; }
-
-                foreach (var d in rows)
-                {
-                    var date = FindDate(d);
-                    if (date == null) continue;
-                    snap.Days.Add(new DayRow
-                    {
-                        Date = date,
-                        Taka = FirstOf(d, "consumedTaka", "consumedAmount", "amount", "taka"),
-                        Units = FirstOf(d, "consumedUnit", "consumedUnits", "unit", "kwh")
-                    });
-                }
-                if (snap.Days.Count > 0) { _knownDaily = ep; Log(ep, $"{snap.Days.Count} rows"); break; }
-                snap.Days.Clear();
-                Log(ep, "rows unparsed");
-            }
-            if (snap.Days.Count > 0) break;
-        }
-        snap.Days = snap.Days.OrderBy(d => d.Date, StringComparer.Ordinal).ToList();
-
-        // ---- monthly consumption ----
-        // This endpoint does NOT take dateFrom/dateTo like the others — it takes
-        // monthFrom/monthTo in yyyy-MM. Sending the wrong spelling returns an empty
-        // payload, and the symptom is an account whose balance and recharge history
-        // work perfectly while the usage chart stays blank: Months ends up empty, the
-        // synthesis below adds a single current-month row, and one row is not history.
-        // Documented spelling first, the old one second in case a variant wants it.
-        var monthFrom = DateTime.Now.AddMonths(-11).ToString("yyyy-MM");
-        var monthTo = DateTime.Now.ToString("yyyy-MM");
-        string[] monthRanges =
-        {
-            $"monthFrom={monthFrom}&monthTo={monthTo}",
-            $"dateFrom={monthFrom}&dateTo={monthTo}"
-        };
-
-        foreach (var ep in Order(MonthlyEndpoints, _knownMonthly))
-        {
-            foreach (var range in monthRanges)
-            {
-                var mc = await TryGet($"{ep}?{pair}&{range}", ct);
-                var rows = AsArray(mc).ToList();
-                if (rows.Count == 0) { Log(ep, $"0 rows ({range[..range.IndexOf('=')]})"); continue; }
-
-                // Parse and validate BEFORE accepting the endpoint. Rows whose month
-                // string is shorter than "yyyy-MM" are dropped downstream, and taking
-                // the endpoint on raw row count alone left Months empty with no
-                // candidates left to try.
-                var parsed = rows.Select(m => new MonthRow
-                {
-                    Month = FirstString(m, "month", "monthName"),
-                    Taka = FirstOf(m, "consumedTaka", "amount"),
-                    Units = FirstOf(m, "consumedUnit", "unit")
-                }).Where(m => m.Month.Length >= 7).ToList();
-
-                if (parsed.Count == 0) { Log(ep, "rows unparsed"); continue; }
-
-                snap.Months.AddRange(parsed);
-                _knownMonthly = ep;
-                Log(ep, $"{parsed.Count} rows ({range[..range.IndexOf('=')]})");
-                break;
-            }
-            if (snap.Months.Count > 0) break;
-        }
-        snap.Months = snap.Months.OrderBy(m => m.Month, StringComparer.Ordinal).ToList();
-
-        // If getBalance surfaced a currentMonthConsumption but the monthly endpoint
-        // didn't include this month, fold it in. Same authoritative source, different
-        // endpoint — some meter types return the monthly list without the running
-        // month appended yet. Without this synthesis, an account whose daily feed is
-        // discarded AND whose monthly list lags a month sees an empty Usage tab
-        // (recharge history still shows, but no chart), when we already have the one
-        // number that matters. Ordering stays sorted so the yearly bar chart draws
-        // this month at the right end of the strip.
+        // ---- synthesise the running month -------------------------------------
+        // Some accounts return a month-to-date figure while the monthly list hasn't
+        // appended the running month yet. Same authoritative source, different endpoint.
+        // Flagged Estimated so Store.SaveSnapshot drops it rather than letting a
+        // month-to-date harden into a completed month next month.
         if (snap.CurrentMonthConsumption > 0)
         {
             var thisMonth = DateTime.Now.ToString("yyyy-MM");
             if (!snap.Months.Any(m => m.Month == thisMonth))
-            {
                 snap.Months.Add(new MonthRow
                 {
                     Month = thisMonth,
                     Taka = snap.CurrentMonthConsumption,
-                    Estimated = true          // month-to-date, not a finished month
+                    Estimated = true
                 });
-                snap.Months = snap.Months.OrderBy(m => m.Month, StringComparer.Ordinal).ToList();
-            }
         }
+        snap.Months = snap.Months.OrderBy(m => m.Month, StringComparer.Ordinal).ToList();
 
-        // ---- daily-feed sanity check ----
-        // The daily-consumption endpoint isn't publicly documented; we probe candidates
-        // and accept whatever answers with a date and a "consumedTaka"-shaped number.
-        // On some meter types the endpoint that finally answers is not returning per-day
-        // Taka increments at all — the values may be cumulative-from-month-start, in
-        // kWh, or on some other scale. When that happens every downstream figure (daily
-        // average, 7-day chart, days-left, live estimate, month-end projection) inherits
-        // the error while MonthSpent — which comes from getBalance's authoritative
-        // currentMonthConsumption — stays right. The card then shows two mutually
-        // contradictory numbers ("Spent this month ৳549" over a 7-day chart whose bars
-        // average ৳314/day, i.e. more per day than the whole month claims to have cost).
-        //
-        // Cross-check this-month daily-row sum against currentMonthConsumption, and also
-        // against the current-month row in the monthly feed when we have it. Discard the
-        // daily rows on a large OVER-report — that's the scale-mismatch signature.
-        // Under-reporting is legitimate (a lagging feed, a missing day or two) and the
-        // EWMA over the days we DO have is still meaningful, so we leave that case alone.
-        // When we discard, Forecast.Build falls through to its monthly-total path — the
-        // same one NESCO uses, which is known to compute correctly.
-        if (snap.Days.Count > 0)
-        {
-            var thisMonth = DateTime.Now.ToString("yyyy-MM");
-            var monthSum = snap.Days.Where(d => d.Date.StartsWith(thisMonth)).Sum(d => d.Taka);
-            var monthlyRowTaka = snap.Months.FirstOrDefault(m => m.Month == thisMonth)?.Taka ?? 0;
-            var reference = snap.CurrentMonthConsumption > 0 ? snap.CurrentMonthConsumption : monthlyRowTaka;
-            if (reference > 0 && monthSum > reference * 2)
-            {
-                Log("daily-sanity",
-                    $"sum ৳{monthSum:0} > 2× ref ৳{reference:0} — daily feed discarded");
-                snap.Days.Clear();
-            }
-        }
+        // No daily endpoint on the new portal. The old daily-feed sanity check (which
+        // discarded a feed whose this-month sum exceeded 2× currentMonthConsumption)
+        // has nothing to guard and is gone with the feed. Restore BOTH together if a
+        // daily endpoint is ever located — an unvalidated feed on an unknown scale is
+        // what produced the "Spent this month ৳549 / Daily avg ৳314" contradiction.
+        Log("daily", "no endpoint on new portal");
 
         ProbeLog = string.Join("\n", _log);
 
-        // Only fail when DESCO gave us nothing whatsoever. A missing balance with
-        // a working recharge history is a partial success, not an error.
-        if (!snap.BalanceReported && snap.CustomerName.Length == 0
-            && snap.Recharges.Count == 0 && snap.Days.Count == 0 && snap.Months.Count == 0)
+        // Only fail when DESCO gave us nothing at all. A missing balance with working
+        // recharge history is a partial success, not an error.
+        if (!snap.BalanceReported && snap.Recharges.Count == 0 && snap.Months.Count == 0)
             return new FetchResult { Error = "No data returned.\n\n" + ProbeLog };
 
         return new FetchResult { Ok = true, Snapshot = snap };
     }
 
-    void Log(string endpoint, string outcome) => _log.Add($"{Short(endpoint),-32} {outcome}");
+    static double? Positive(double v) => v > 0 ? v : null;
 
-    // Try whatever worked last time first.
-    static IEnumerable<string> Order(string[] all, string? known) =>
-        known == null ? all : new[] { known }.Concat(all.Where(x => x != known));
-
-    async Task<JsonElement?> TryGet(string url, CancellationToken ct)
+    /// <summary>
+    /// The row for this account out of the realtime-balance payload. The response is
+    /// { enabled, meters: [ … ] } — one entry per meter on the login, so a user with
+    /// two meters gets two, and matching on the account the user typed is the only way
+    /// to pick the right one. Falls back to the first entry, then to the bare object
+    /// in case a future shape drops the wrapper.
+    /// </summary>
+    static JsonElement? PickMeter(JsonElement root, string account)
     {
-        try
+        if (root.ValueKind == JsonValueKind.Object
+            && root.TryGetProperty("meters", out var meters)
+            && meters.ValueKind == JsonValueKind.Array)
         {
-            using var req = new HttpRequestMessage(HttpMethod.Get, url);
-            // Look exactly like the Angular portal's own XHR calls.
-            req.Headers.TryAddWithoutValidation("Accept", "application/json, text/plain, */*");
-            req.Headers.Referrer = new Uri("https://prepaid.desco.org.bd/customer/");
-            req.Headers.TryAddWithoutValidation("Origin", "https://prepaid.desco.org.bd");
-
-            using var res = await _http.SendAsync(req, ct);
-            var body = await res.Content.ReadAsStringAsync(ct);
-
-            if (!res.IsSuccessStatusCode)
+            JsonElement? first = null;
+            foreach (var m in meters.EnumerateArray())
             {
-                Log(url, $"HTTP {(int)res.StatusCode} {Snip(body)}");
-                return null;
+                first ??= m;
+                if (FirstString(m, "accountNo") == account || FirstString(m, "meterNo") == account)
+                    return m;
             }
-
-            try
-            {
-                using var doc = JsonDocument.Parse(body);
-                // Most endpoints wrap the payload in { "data": ... }; a few return it bare.
-                if (doc.RootElement.TryGetProperty("data", out var data))
-                {
-                    if (data.ValueKind == JsonValueKind.Null)
-                    {
-                        // Surface the API's own explanation, e.g. { code:404, desc:"..." }.
-                        var why = FirstString(doc.RootElement, "desc", "message", "msg", "code");
-                        Log(url, "data:null" + (why.Length > 0 ? " " + Snip(why) : ""));
-                        return null;
-                    }
-                    return data.Clone();
-                }
-                return doc.RootElement.Clone();
-            }
-            catch
-            {
-                Log(url, $"not JSON: {Snip(body)}");   // e.g. a WAF/captcha HTML page
-                return null;
-            }
+            return first;
         }
-        catch (Exception e)
-        {
-            // DNS, TLS, timeout — name it instead of hiding it.
-            Log(url, $"{e.GetType().Name}: {Snip(e.InnerException?.Message ?? e.Message)}");
-            return null;
-        }
-    }
-
-    /// <summary>One line, 60 chars, no tags — enough to recognise an error page.</summary>
-    static string Snip(string? s)
-    {
-        s = Regex.Replace(s ?? "", @"<[^>]*>|\s+", " ").Trim();
-        return s.Length > 60 ? s[..60] + "…" : s;
+        return root.ValueKind == JsonValueKind.Object ? root : null;
     }
 
     /// <summary>
-    /// The rows we want are sometimes the `data` array itself, and sometimes an array
-    /// nested one level inside it. Don't assume — go and find it.
+    /// ISO-8601 with a Z suffix → LOCAL time. The portal reports UTC; Dhaka is +6, so
+    /// treating these as local would shift every read time by six hours and make a
+    /// midnight read look like a 6am one.
     /// </summary>
+    static DateTime? ParseIso(string s) =>
+        DateTimeOffset.TryParse(s, CultureInfo.InvariantCulture,
+            DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal, out var d)
+            ? d.LocalDateTime : null;
+
+    // --- JSON helpers. Same contracts as the previous DescoProvider: DESCO's wrapping
+    //     and field naming are both inconsistent, so never read one hardcoded name and
+    //     never assume a bare array. ---
+
     static IEnumerable<JsonElement> AsArray(JsonElement? e)
     {
         if (e is null) yield break;
@@ -491,34 +392,29 @@ public class DescoProvider : IProvider
                 }
     }
 
-    static string Str(JsonElement e, string name) =>
-        e.ValueKind == JsonValueKind.Object && e.TryGetProperty(name, out var v) && v.ValueKind != JsonValueKind.Null
-            ? v.ToString() ?? "" : "";
-
-    static double Dbl(JsonElement e, string name) =>
-        e.ValueKind == JsonValueKind.Object && e.TryGetProperty(name, out var v)
-            ? v.ValueKind == JsonValueKind.Number ? v.GetDouble() : Providers.Num(v.ToString())
-            : 0;
-
-    /// <summary>True if the object has a non-null property with this name (case-insensitive).</summary>
-    static bool HasField(JsonElement e, string name)
+    static double FirstOf(JsonElement e, params string[] names)
     {
-        if (e.ValueKind != JsonValueKind.Object) return false;
-        foreach (var p in e.EnumerateObject())
-            if (string.Equals(p.Name, name, StringComparison.OrdinalIgnoreCase)
-                && p.Value.ValueKind != JsonValueKind.Null)
-                return true;
-        return false;
+        if (e.ValueKind != JsonValueKind.Object) return 0;
+        foreach (var n in names)
+            foreach (var p in e.EnumerateObject())
+                if (string.Equals(p.Name, n, StringComparison.OrdinalIgnoreCase))
+                    return p.Value.ValueKind == JsonValueKind.Number
+                        ? p.Value.GetDouble() : Providers.Num(p.Value.ToString());
+        return 0;
     }
 
-    /// <summary>Property names of a JSON object, for the probe log.</summary>
-    static IEnumerable<string> FieldNames(JsonElement e)
+    static string FirstString(JsonElement e, params string[] names)
     {
-        if (e.ValueKind != JsonValueKind.Object) yield break;
-        foreach (var p in e.EnumerateObject()) yield return p.Name;
+        if (e.ValueKind != JsonValueKind.Object) return "";
+        foreach (var n in names)
+            foreach (var p in e.EnumerateObject())
+                if (string.Equals(p.Name, n, StringComparison.OrdinalIgnoreCase)
+                    && p.Value.ValueKind != JsonValueKind.Null)
+                    return p.Value.ToString() ?? "";
+        return "";
     }
 
-    /// <summary>Every non-empty field of a JSON object, prettified for the detail modal.</summary>
+    /// <summary>Every non-empty scalar field, prettified for the detail modal.</summary>
     static Dictionary<string, string> AllFields(JsonElement e)
     {
         var d = new Dictionary<string, string>();
@@ -535,49 +431,14 @@ public class DescoProvider : IProvider
         }
         return d;
     }
-
-    /// <summary>Field names differ between DESCO's endpoints; take the first present, case-insensitively.</summary>
-    static double FirstOf(JsonElement e, params string[] names)
-    {
-        if (e.ValueKind != JsonValueKind.Object) return 0;
-        foreach (var n in names)
-            foreach (var p in e.EnumerateObject())
-                if (string.Equals(p.Name, n, StringComparison.OrdinalIgnoreCase))
-                    return p.Value.ValueKind == JsonValueKind.Number ? p.Value.GetDouble() : Providers.Num(p.Value.ToString());
-        return 0;
-    }
-
-    static string FirstString(JsonElement e, params string[] names)
-    {
-        if (e.ValueKind != JsonValueKind.Object) return "";
-        foreach (var n in names)
-            foreach (var p in e.EnumerateObject())
-                if (string.Equals(p.Name, n, StringComparison.OrdinalIgnoreCase) && p.Value.ValueKind != JsonValueKind.Null)
-                    return p.Value.ToString() ?? "";
-        return "";
-    }
-
-    /// <summary>Any property whose value starts with a yyyy-MM-dd date.</summary>
-    static string? FindDate(JsonElement e)
-    {
-        if (e.ValueKind != JsonValueKind.Object) return null;
-        foreach (var p in e.EnumerateObject())
-        {
-            var v = p.Value.ToString();
-            if (v is { Length: >= 10 } && Regex.IsMatch(v[..10], @"^\d{4}-\d{2}-\d{2}$"))
-                return v[..10];
-        }
-        return null;
-    }
-
-    static DateTime? ParseTime(string s) =>
-        DateTime.TryParse(s, CultureInfo.InvariantCulture, DateTimeStyles.None, out var d) ? d : null;
 }
 
 // ---------------------------------------------------------------------------
 // NESCO — no API. The portal is a Laravel form: GET for the CSRF token, then
 // POST {_token, cust_no, submit}, where `submit` is a Bengali label choosing
 // which table comes back. No login, no captcha.
+//
+// UNCHANGED by the DESCO migration.
 // ---------------------------------------------------------------------------
 public class NescoProvider : IProvider
 {
@@ -613,13 +474,13 @@ public class NescoProvider : IProvider
                 return new FetchResult { Error = "No NESCO consumer found for that number." };
 
             snap.CustomerName = Pick(fields, 1, "নাম", "name");
-            snap.Address      = Pick(fields, 3, "ঠিকানা", "address");
-            snap.MeterNo      = Pick(fields, 8, "মিটার", "meter");
+            snap.Address = Pick(fields, 3, "ঠিকানা", "address");
+            snap.MeterNo = Pick(fields, 8, "মিটার", "meter");
 
             // Numbers the portal actually publishes about this meter. Both are
             // OPTIONAL: if NESCO doesn't render the field, these stay null and the
             // UI stays quiet about them. Never substitute a guess.
-            snap.MinRecharge      = PickNum(fields, "মিনিমাম রিচার্জ", "সর্বনিম্ন রিচার্জ", "minimum recharge", "min recharge");
+            snap.MinRecharge = PickNum(fields, "মিনিমাম রিচার্জ", "সর্বনিম্ন রিচার্জ", "minimum recharge", "min recharge");
             snap.EmergencyBalance = PickNum(fields, "জরুরি", "জরুরী", "ইমার্জেন্সি", "emergency");
 
             // Prefer a labelled balance field; the portal otherwise puts it last.
@@ -641,18 +502,12 @@ public class NescoProvider : IProvider
             // caption under the label: "(সময়ঃ 11 July 2026 12:00:00 AM)". That
             // moment — not our sync time — is how fresh the money figure really
             // is, and it's what lets the app count the meter's actual updates.
-            // Matching raw HTML was too brittle: the caption is wrapped in its own
-            // element, so any <span>/<br>/&nbsp; between "সময়ঃ" and the date broke
-            // it silently. Flatten the page first, then read it.
             snap.ReadingTime = ExtractReadingTime(rechargeHtml);
 
             // The portal's recharge table has shipped with 12, 13 and 14+ column
             // variants, so hard-coded indices silently produce zero rows. Find the
             // columns instead: headers first, cell content as the fallback.
             var headers = HeaderCells(rechargeHtml);
-            // The portal's actual headers: gross is "রিচার্জের পরিমাণ (টাকা)",
-            // energy is "বিদ্যুৎ (টাকা)". Column order puts "বিদ্যুৎ (টাকা)"
-            // before "সম্ভাব্য বিদ্যুৎ এর পরিমাণ", so first-match is the right one.
             int amountCol = FindHeader(headers, "রিচার্জের পরিমাণ", "মোট", "total", "gross", "recharge amount");
             int energyCol = FindHeader(headers, "বিদ্যুৎ", "এনার্জি", "energy");
             int viaCol = FindHeader(headers, "অপারেটর", "operator", "মাধ্যম", "channel");
@@ -736,7 +591,9 @@ public class NescoProvider : IProvider
     {
         var form = new FormUrlEncodedContent(new Dictionary<string, string>
         {
-            ["_token"] = token, ["cust_no"] = account, ["submit"] = submit
+            ["_token"] = token,
+            ["cust_no"] = account,
+            ["submit"] = submit
         });
         var req = new HttpRequestMessage(HttpMethod.Post, Panel) { Content = form };
         req.Headers.Referrer = new Uri(Panel);
@@ -792,20 +649,14 @@ public class NescoProvider : IProvider
 
     /// <summary>
     /// When NESCO last read this meter's balance — the "(সময়ঃ 11 July 2026
-    /// 12:00:00 AM)" caption under the balance box. This is the only honest
-    /// freshness signal the portal gives: NESCO's figure moves once a day, so our
-    /// sync clock says nothing about whether the money on screen is current.
+    /// 12:00:00 AM)" caption under the balance box.
     ///
     /// Two traps, both of which silently returned null before:
     ///   1. UNICODE. "সময়" can be encoded two ways — য়=U+09DF precomposed, or
     ///      য+় = U+09AF U+09BC decomposed. They render identically and compare
-    ///      UNEQUAL. The portal serves one; a regex literal holds the other. Both
-    ///      sides are normalised to FormD here so the bytes actually line up.
+    ///      UNEQUAL. Both sides are normalised to FormD here.
     ///   2. MARKUP. The caption is its own element, so tags between the keyword
     ///      and the date broke a raw-HTML match. We flatten first.
-    /// If the keyword can't be found at all, fall back to the caption's distinctive
-    /// SPACE-separated date shape ("11 July 2026"). The install-date field nearby
-    /// is dash-separated ("20-Feb-2025"), so it can't be mistaken for this one.
     /// </summary>
     public static DateTime? ExtractReadingTime(string html)
     {
@@ -848,11 +699,6 @@ public class NescoProvider : IProvider
             ? d : null;
     }
 
-    /// <summary>
-    /// First field whose label mentions any of these words. If the portal drops its
-    /// labels, fall back to a known position: index >= 0 counts from the start,
-    /// -1 means the last field (where the balance lives).
-    /// </summary>
     /// <summary>
     /// Bangla label comparison, immune to the nukta trap: য়/ড়/ঢ় each have a
     /// precomposed AND a decomposed encoding that render identically but compare
@@ -940,9 +786,7 @@ public class NescoProvider : IProvider
     /// No usable amount header: pick the money cell ourselves. The gross amount
     /// is often a PLAIN INTEGER (500) while its components carry decimals
     /// (478.56, 354.36) — the old decimals-first rule therefore returned the
-    /// energy amount, not what the customer paid. Consider both in one pass:
-    /// serials and seq numbers are tiny, consumer/meter numbers and tokens are
-    /// 8+ digits, so a 2–6 digit value in the money range wins by magnitude.
+    /// energy amount, not what the customer paid.
     /// </summary>
     static double GuessAmount(List<string> row, int dateIdx)
     {

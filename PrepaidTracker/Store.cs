@@ -15,10 +15,9 @@ public static class Store
     /// Deserialized-file cache. Snapshot(), Readings() and MeterUpdateCount() are each
     /// called TWICE per refresh — once from the page's StateToken(), once from its
     /// Render() — and every one of those was a File.Exists + ReadAllText + Deserialize
-    /// on the UI thread. Switching account fires Refresh() three times in a row (the
-    /// switch itself, then "syncing…", then the result), so a single tap on the account
-    /// chip did well over a dozen synchronous file reads while the modal's fade-out was
-    /// being ticked on that same thread — which is what stalled the dismissal.
+    /// on the UI thread. Switching account fires Refresh() three times in a row, so a
+    /// single tap on the account chip did well over a dozen synchronous file reads while
+    /// the modal's fade-out was being ticked on that same thread.
     ///
     /// The cache is keyed by path and dropped on Write/Delete, so it can never serve a
     /// stale file: nothing else writes to this directory. BackgroundSync writes these
@@ -95,16 +94,34 @@ public static class Store
     }
 
     /// <summary>
+    /// Persist a single meter that is already in the list, by id. Used by Sync when the
+    /// portal reports something worth remembering on the meter itself — currently the
+    /// DESCO sanction load, which the recharge suggestion needs on syncs where the
+    /// summary endpoint didn't answer.
+    ///
+    /// Deliberately NOT an upsert: a meter that isn't in the list is a bug upstream, and
+    /// silently inserting it here would resurrect accounts the user just deleted — a
+    /// background sync holding a stale Meter object would put it straight back.
+    /// </summary>
+    public static void SaveMeter(Meter meter)
+    {
+        var list = Meters();
+        var idx = list.FindIndex(x => x.Id == meter.Id);
+        if (idx < 0) return;
+
+        list[idx] = meter;
+        _meters = list;
+        Write(MetersPath, list);
+    }
+
+    /// <summary>
     /// Adding an account that is already here is a SELECT, not an insert.
     ///
     /// This used to dedupe on Id alone — and Id is a fresh Guid minted by the Meter
     /// initialiser, so the same account entered twice ALWAYS produced two rows. Nothing
     /// downstream ever compares Account: the once-a-day guard is keyed "alert-{Id}" and
     /// the queued reminders are keyed "low-{Id}-{i}". Two rows for one meter therefore
-    /// meant two independent alert slots and two independent sets of 9am reminders, firing
-    /// together with a byte-identical body. On Android they collapse (Show hashes
-    /// title+body into a stable notification id); on iOS every request carries its own
-    /// identifier, so they stack — two, or three, of the same banner at 9:00.
+    /// meant two independent alert slots and two independent sets of 9am reminders.
     ///
     /// Identity is utility + account number. The existing row's Id is kept: its readings,
     /// its snapshot and its armed notifications all hang off it.
@@ -140,15 +157,12 @@ public static class Store
     /// One-time cleanup for installs that already collected duplicate rows before AddMeter
     /// started refusing them. The losers go through DeleteMeter, so their queued
     /// notifications are cancelled rather than left armed in the OS for another three
-    /// mornings. Cheap enough to call on every launch; returns immediately in the normal
-    /// case where nothing is duplicated.
+    /// mornings.
     ///
     /// The survivor of each group is the row with the MOST readings, not simply the oldest.
-    /// Which duplicate the user has actually been syncing is a coin flip — it is whichever
-    /// one SelectedMeterId happened to land on — and that row is the one holding the
-    /// history the forecast is built from. Deleting it would reset days-left to nothing and
-    /// silence the alerts entirely for several days, which is a worse bug than the one being
-    /// fixed. Ties break toward the currently selected row, then toward the oldest.
+    /// Which duplicate the user has actually been syncing is a coin flip, and that row is
+    /// the one holding the history the forecast is built from. Ties break toward the
+    /// currently selected row, then toward the oldest.
     /// </summary>
     public static void DedupeMeters()
     {
@@ -179,8 +193,7 @@ public static class Store
             {
                 if (m.Id == keep.Id) continue;
                 // Don't lose the user's place: if the row being removed was the selected
-                // one, the selection moves to its survivor rather than to whatever happens
-                // to sit first in the file.
+                // one, the selection moves to its survivor.
                 if (SelectedMeterId == m.Id) SelectedMeterId = keep.Id;
                 DeleteMeter(m.Id);
             }
@@ -190,12 +203,23 @@ public static class Store
     public static void DeleteMeter(string id)
     {
         var list = Meters();
+        var meter = list.FirstOrDefault(x => x.Id == id);
         list.RemoveAll(x => x.Id == id);
+
         // A removed account must stop talking. Without this its pre-armed 9am reminders
         // stayed in the OS queue and kept firing for up to three more mornings, naming an
         // account the app no longer holds.
         Notifier.CancelFor(id);
         SetScheduledAlerts(id, "");
+
+        // Destroy the DESCO credential with the account. The portal's new login means the
+        // app now holds a PASSWORD and a session cookie, not just a meter number — and
+        // leaving either in the Keychain after the user deleted the account is keeping a
+        // secret they believe they just threw away. Keyed by account number, because that
+        // is what DescoApi keys on; DeleteMeter is also the only place that knows both.
+        if (meter is { Utility: Utility.Desco } && meter.Account.Length > 0)
+            DescoApi.SignOut(meter.Account);
+
         _meters = list;
         Write(MetersPath, list);
         Forget(ReadingsPath(id)); Forget(SnapshotPath(id)); Forget(UpdatesPath(id)); Forget(VerdictsPath(id));
@@ -239,20 +263,19 @@ public static class Store
 
     public static void SaveSnapshot(string id, Snapshot s)
     {
-        // Accumulate the daily feed across syncs. DESCO's daily endpoint returns only a
-        // short rolling window, so a plain overwrite loses every day it stops returning —
-        // which is what made a two-day feed on the 15th look like a two-day month. Merge
-        // the incoming rows with what we already had (newest value wins for a given date),
-        // so the chart, the EWMA rate, and the month-to-date keep a full history even when
-        // one sync comes back short. Bounded to the last 400 days so the file can't grow
-        // without limit. NESCO never carries daily rows, so this is a no-op for it.
         var prev = Snapshot(id);
+
+        // Accumulate the daily feed across syncs. DESCO's old daily endpoint returned
+        // only a short rolling window, so a plain overwrite lost every day it stopped
+        // returning — which is what made a two-day feed on the 15th look like a two-day
+        // month. Merge incoming rows with what we had (newest value wins for a date),
+        // bounded to 400 days. Kept despite the new portal exposing no daily endpoint:
+        // installs upgrading from the old build still hold real history here, and
+        // discarding it on first sync would reset their charts to nothing.
         if (prev is { Days.Count: > 0 })
         {
             if (s.Days.Count == 0)
             {
-                // This sync brought no daily feed at all (a transient DESCO hiccup, or a
-                // NESCO snapshot for this id). Keep the history rather than discard it.
                 s.Days = prev.Days;
             }
             else
@@ -266,14 +289,12 @@ public static class Store
             }
         }
 
-        // Same treatment for the monthly history, which had none: a plain overwrite meant
-        // one failed monthly call dropped a year of chart. But months cannot be merged as
-        // bluntly as days. A row flagged Estimated is the running month synthesised from
-        // currentMonthConsumption — carried forward it would sit in next month's history
-        // as a completed month that never happened. So prior ESTIMATED rows are dropped
-        // and only genuine finished months are kept; the incoming set wins wherever the
-        // two overlap, which is how an estimated row gets replaced by the real one once
-        // the utility publishes it.
+        // Same treatment for the monthly history. But months cannot be merged as bluntly
+        // as days: a row flagged Estimated is the running month synthesised from
+        // currentMonthConsumption, and carried forward it would sit in next month's
+        // history as a completed month that never happened. So prior ESTIMATED rows are
+        // dropped and only genuine finished months kept; the incoming set wins wherever
+        // the two overlap, which is how an estimated row gets replaced by the real one.
         if (prev is { Months.Count: > 0 })
         {
             var byMonth = prev.Months
@@ -285,6 +306,28 @@ public static class Store
                 .TakeLast(36)
                 .ToList();
         }
+
+        // Carry forward what the portal states only intermittently.
+        //
+        // NextEligible is the moment DESCO will allow another live meter read. It comes
+        // back on the realtime-balance call and nowhere else, so a sync that fails after
+        // that point — or a NESCO sync overwriting a shared field — would drop it, the
+        // refresh button would unlock early, the request would be refused, and the user
+        // would learn that the control lies. Same class of bug as the year of monthly
+        // history that vanished after one failed sync.
+        //
+        // The guard is on the VALUE, not the sync: once the moment has passed there is
+        // nothing to preserve, so a stale limit can never outlive itself and jam the
+        // button shut.
+        if (s.NextEligible is null && prev?.NextEligible is { } priorLimit && priorLimit > DateTime.Now)
+            s.NextEligible = priorLimit;
+
+        // Sanction load changes essentially never (it's the contracted load on the
+        // connection), and it arrives only from the summary endpoint. Keeping the last
+        // known figure means one unanswered summary call doesn't silently switch the
+        // recharge suggestion back to its fallback path mid-month.
+        if (s.SanctionLoadKw <= 0 && prev is { SanctionLoadKw: > 0 })
+            s.SanctionLoadKw = prev.SanctionLoadKw;
 
         Write(SnapshotPath(id), s);
     }
@@ -312,7 +355,7 @@ public static class Store
 
     // ---------- meter update log ----------
     // Every DISTINCT reading time the utility has published for this meter.
-    // The count answers "how many times has NESCO actually updated my balance"
+    // The count answers "how many times has the utility actually updated my balance"
     // — as opposed to how many times we synced and saw the same stale figure.
     static string UpdatesPath(string id) => Path.Combine(Dir, $"updates-{id}.json");
 
@@ -332,9 +375,7 @@ public static class Store
 
     /// <summary>
     /// Anonymous, per-install id. NOT the account number and not anything about the
-    /// person — the server only ever needs to answer "is this install still allowed in",
-    /// and a random GUID answers that without shipping a real customer's identity to a
-    /// box on the internet.
+    /// person — the server only ever needs to answer "is this install still allowed in".
     /// </summary>
     public static string InstallId
     {
@@ -361,7 +402,14 @@ public static class Store
         set => Preferences.Set("blocked", value);
     }
 
-    /// <summary>Everything the user added, gone. Used when the owner blocks the device.</summary>
+    /// <summary>
+    /// Everything the user added, gone. Used when the owner blocks the device.
+    ///
+    /// DeleteMeter now also clears each DESCO account's stored password and session, so
+    /// a wipe genuinely leaves nothing behind. That matters more than it did before the
+    /// portal added a login: a wipe used to destroy meter numbers, and now it destroys
+    /// credentials.
+    /// </summary>
     public static void WipeMeters()
     {
         foreach (var m in Meters().ToList()) DeleteMeter(m.Id);
@@ -388,9 +436,7 @@ public static class Store
 
     // Store.EmergencyCredit lived here: a user-supplied figure for the emergency credit
     // NESCO doesn't publish. Deleted along with its Profile row — it was never filled in,
-    // so the banner clause it fed never showed. The old "emergencyCredit" Preferences key
-    // is simply left behind; reading it is what cost nothing, and writing a migration to
-    // delete a stale string would cost more than the string does.
+    // so the banner clause it fed never showed.
 
     public static int LowDays
     {
@@ -398,7 +444,7 @@ public static class Store
         set => Preferences.Set("lowDays", value);
     }
 
-    /// <summary>Alert when the balance falls under this many Taka. PrepaidPro alerts on money; days-left is the second trigger.</summary>
+    /// <summary>Alert when the balance falls under this many Taka.</summary>
     public static int LowTaka
     {
         get => Preferences.Get("lowTaka", 200);
@@ -432,8 +478,7 @@ public static class Store
 
     /// <summary>
     /// Every meter id we've ever handed to the notifier, kept so an orphan sweep can find
-    /// alerts still queued for a meter that's since been deleted or replaced. Written on
-    /// every schedule call; pruned to the currently-alive set by <see cref="Notifier.SweepOrphans"/>.
+    /// alerts still queued for a meter that's since been deleted or replaced.
     /// </summary>
     public static HashSet<string> KnownMeterIds()
     {

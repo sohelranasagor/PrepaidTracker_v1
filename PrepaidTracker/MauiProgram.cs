@@ -7,6 +7,36 @@ public static class MauiProgram
 {
     public static MauiApp CreateMauiApp()
     {
+#if IOS
+        // MUST run before anything touches SecureStorage.
+        //
+        // DESCO's rebuilt portal requires a login, so the app now keeps a password and a
+        // session cookie in the Keychain. MAUI's default accessibility class is
+        // kSecAttrAccessibleWhenUnlocked, which means those items are UNREADABLE while
+        // the phone is locked — and a BGAppRefreshTask fires precisely when the phone is
+        // sitting locked in someone's pocket. The sync would find no credential, report
+        // the session as gone, and post "sign in to DESCO again" at 3am to a user whose
+        // session was perfectly fine.
+        //
+        // AfterFirstUnlock keeps the item readable from the first unlock after boot
+        // onward, which is what a background task needs. ThisDeviceOnly keeps it out of
+        // iCloud Keychain backups: a utility password has no business syncing to the
+        // user's other devices, and this app's whole privacy story is that credentials
+        // stay on the phone that entered them.
+        //
+        // Android is unaffected — Keystore has no equivalent lock-state restriction — so
+        // without this the app would work on Android and silently misbehave on iOS only,
+        // which is the hardest kind of bug to hear about from users.
+        //
+        // VERIFY the property name against your MAUI version: this API has moved between
+        // releases. If it doesn't resolve, the equivalent is setting
+        // SecAccessible.AfterFirstUnlockThisDeviceOnly on the platform SecureStorage
+        // implementation. Existing Keychain items keep whatever class they were written
+        // with, so users who signed in before this shipped will be asked once more.
+        SecureStorage.Default.DefaultAccessible =
+            Security.SecAccessible.AfterFirstUnlockThisDeviceOnly;
+#endif
+
         _ = Access.RefreshConfigAsync();
         var builder = MauiApp.CreateBuilder();
         builder.UseMauiApp<App>();
