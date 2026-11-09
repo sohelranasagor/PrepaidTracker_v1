@@ -20,7 +20,7 @@ namespace PrepaidTracker;
 /// </summary>
 public abstract class AppPage : ContentPage
 {
-    public Grid Root { get; }
+    public Grid Root { get; } = new();
     string _lastToken = "\u0000";
 
     protected AppPage()

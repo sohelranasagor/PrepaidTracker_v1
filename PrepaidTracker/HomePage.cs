@@ -263,7 +263,7 @@ public class HomePage : AppPage
         // bank it again — AddReading replaces by date, so this is a correction, not a
         // duplicate. Home used to skip this entirely, so verdicts only ever settled on a
         // background sync, which on iOS might be days away.
-        if (Reconcile.Run(meter, result.Snapshot, f?.DailyAvg ?? 0))
+        if (Reconcile.Run(meter, result.Snapshot!, f?.DailyAvg ?? 0))
         {
             PrepaidTracker.Sync.Record(meter, result.Snapshot);
             Refresh();
@@ -755,7 +755,8 @@ public class HomePage : AppPage
     /// </summary>
     View SyncButton(Snapshot? snap)
     {
-        var blocked = snap?.NextEligible is { } next && DateTime.Now < next;
+        var nextRead = snap?.NextEligible;
+        var blocked = nextRead is { } n && DateTime.Now < n;
         var icon = StrokeIcon(RefreshPath, blocked ? Theme.Faint : Theme.Green, 14, 1.6);
 
         var b = new Border
@@ -782,7 +783,7 @@ public class HomePage : AppPage
             {
                 // Still a tap target: it explains the limit rather than doing nothing,
                 // which would read as a broken button.
-                var when = snap!.NextEligible!.Value;
+                var when = nextRead!.Value;
                 await Modal.Info(Root, L.S("refresh"),
                     L.S("quotaReached", when.ToString("d MMM ") + L.T12(when.ToString("HH:mm")))
                     + "\n\n" + L.S("quotaHint"));
