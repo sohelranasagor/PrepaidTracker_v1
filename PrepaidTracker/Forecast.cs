@@ -584,7 +584,7 @@ public class Forecast
     ///
     ///     est = snap.Balance
     ///         − rate × (hours since reading / 24)
-    ///         + recharges dated AFTER the reading
+    ///         + recharges made AFTER the reading
     ///
     /// The RATE isn't just the EWMA — assuming today looks like your long-run average
     /// when yesterday was actually quiet will confidently deduct spending that never
@@ -648,17 +648,16 @@ public class Forecast
             rate = 0.7 * recent + 0.3 * ewma;
         }
 
-        // A recharge dated D happens DURING day D — hours after that day's midnight read
-        // — so it is NOT in the balance dated D; it first appears in the balance dated
-        // D+1. Without adding it back, a user who tops up in the morning watches the
-        // estimate keep sliding as if the money never arrived. Same window as Sync.Record.
+        // Recharges made after the read are not in the measured balance yet, so they
+        // are added back. Compared by MOMENT, not by date: NESCO reads at midnight, so
+        // "dated today or later" and "after the read" were the same thing, but DESCO's
+        // read is whenever the last live read happened (09:05, say), and a recharge at
+        // 08:00 the same day is already in that balance. See AfterRead.
         //
         // Key-change sets are excluded: their amount is not a credit landing on the
         // meter, and adding it would make the chip hundreds of taka optimistic.
-        var readDate = readAt.ToString("yyyy-MM-dd");
         var pending = snap.Recharges
-            .Where(r => r.Success && !r.MultiToken
-                     && string.Compare(r.Date, readDate, StringComparison.Ordinal) >= 0)
+            .Where(r => r.Success && !r.MultiToken && AfterRead(r, readAt))
             .Sum(r => r.EnergyAmount > 0 ? r.EnergyAmount : r.Amount);
 
         // ...and the FAILED ones dated after the read, on trust. A portal "failed"
@@ -669,7 +668,7 @@ public class Forecast
         //
         // Self-expiring, which is the whole safety argument: a recharge dated D sits in
         // this window only until the read dated D+1 lands, at which point it falls BEHIND
-        // readDate and drops out whether it landed or not.
+        // the read date and drops out whether it landed or not.
         if (meterId.Length > 0) pending += Reconcile.UnverifiedCredit(meterId, snap);
 
         LiveWhyNot = "shown";
@@ -677,6 +676,23 @@ public class Forecast
         // Return regardless of sign — a negative estimate is meaningful information
         // (emergency credit deepening), not noise. The renderer colours the chip by sign.
         return snap.Balance - rate * (elapsedHours / 24.0) + pending;
+    }
+
+    /// <summary>
+    /// True when a recharge happened after the meter read, so it is not yet in the
+    /// measured balance. Uses the recharge's time when the portal gave one; otherwise
+    /// falls back to "dated on or after the read's date", the original midnight rule.
+    /// </summary>
+    static bool AfterRead(RechargeRow r, DateTime readAt)
+    {
+        var readDate = readAt.ToString("yyyy-MM-dd");
+
+        if (r.Time.Length >= 4 &&
+            DateTime.TryParseExact($"{r.Date} {r.Time}", new[] { "yyyy-MM-dd HH:mm", "yyyy-MM-dd H:mm" },
+                CultureInfo.InvariantCulture, DateTimeStyles.None, out var at))
+            return at > readAt;
+
+        return string.Compare(r.Date, readDate, StringComparison.Ordinal) >= 0;
     }
 
     public static DateTime Date(string ymd) =>
