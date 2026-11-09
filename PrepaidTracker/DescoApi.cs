@@ -89,6 +89,11 @@ internal static class Wire
     // through to its own-readings path — which needs three distinct meter reads before
     // the first chart bar appears. At one read a day, that is three days.
 
+    // Collection-level and FREE: returns the cached reading for every linked meter plus
+    // the quota state. Different endpoint from the account-scoped POST below, which
+    // spends the day's allowance. A GET against that one returns 500.
+    public const string PathRealtimeAll = "/api/accounts/realtime-balance";
+
     public static readonly TimeSpan SessionTtl = TimeSpan.FromMinutes(5);
 }
 

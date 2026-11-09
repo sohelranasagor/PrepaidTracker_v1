@@ -106,6 +106,12 @@ foreach (var p in prefixes)
         }
         catch (Exception e) { Console.WriteLine($"ERR {verb,-4} {leaf}  {e.Message}"); }
     }
+Console.WriteLine("\n=== collection-level realtime-balance (the free cached one) ===");
+using (var rb = await http.GetAsync(Base + "/api/accounts/realtime-balance"))
+{
+    Console.WriteLine($"{(int)rb.StatusCode} GET /api/accounts/realtime-balance");
+    Console.WriteLine(await rb.Content.ReadAsStringAsync());
+}
 
 static string Esc(string s) => System.Text.Json.JsonSerializer.Serialize(s);
 static string Trim(string s, int n = 160) =>
