@@ -200,23 +200,22 @@ public class Snapshot
     public double? MinRecharge { get; set; }
 
     /// <summary>
-    /// DESCO's new portal RATIONS live meter reads — roughly one a day, after which it
-    /// answers status DAILY_LIMIT_REACHED and names the next eligible moment. This is
-    /// that moment, in LOCAL time; null means no limit was reported (and always, for
-    /// NESCO).
+    /// When DESCO will allow this meter's next live read, in LOCAL time. Set only when
+    /// DESCO says today's read is used up (status DAILY_LIMIT_REACHED); null means a
+    /// read is available (and always, for NESCO).
     ///
-    /// Two consequences the rest of the app has to honour. The refresh control stays
-    /// disabled until this passes, because a button that can only fail is worse than a
-    /// greyed one. And background syncs never request a fresh read at all: they use the
-    /// portal's cached figure, which costs nothing against the quota. The old habit of
-    /// syncing live on every app open would exhaust the day's allowance before noon and
-    /// leave the user unable to refresh when it actually mattered.
-    ///
-    /// Must survive <see cref="Store.SaveSnapshot"/>'s merge. A failed sync that drops
-    /// it re-enables the button early, the request is refused, and the user learns the
-    /// control lies.
+    /// While it is in the future the refresh control is greyed, and tapping it shows
+    /// DESCO's limit message instead of sending a request. Background syncs never
+    /// request a fresh read at all: they use the portal's free cached figure.
     /// </summary>
     public DateTime? NextEligible { get; set; }
+
+    /// <summary>
+    /// True when THIS sync heard DESCO's quota verdict. NextEligible is then current
+    /// even when null ("not limited"), and Store.SaveSnapshot must not bring back an
+    /// older stored limit over it. Not persisted.
+    /// </summary>
+    [JsonIgnore] public bool QuotaKnown { get; set; }
 
     /// <summary>
     /// Sanction load in kW as reported by the portal this sync; 0 when absent. Copied
