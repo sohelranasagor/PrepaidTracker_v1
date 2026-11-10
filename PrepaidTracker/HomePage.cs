@@ -65,7 +65,8 @@ public class HomePage : AppPage
         {
             Invalidate();
             // A deliberate pull is the user asking for a NEW number, so this is one of
-            // only two paths allowed to spend DESCO's once-a-day live meter read.
+            // only two paths allowed to spend DESCO's once-a-day live meter read. The
+            // provider checks DESCO's limit first and only asks the meter if allowed.
             await Sync(userRequestedFresh: true);
             _refresh.IsRefreshing = false;
         };
@@ -151,9 +152,9 @@ public class HomePage : AppPage
 
     /// <param name="silent">No error modal — used by the on-appear auto-sync.</param>
     /// <param name="userRequestedFresh">
-    /// True only when the person tapped refresh or pulled down. DESCO's rebuilt portal
-    /// rations live meter reads to roughly one a day; every other path reads their
-    /// cached figure, which costs nothing against the quota.
+    /// True only when the person tapped refresh or pulled down. DESCO allows one fresh
+    /// meter read per meter per day; every other path reads their cached figure, which
+    /// costs nothing against the limit.
     /// </param>
     public async Task Sync(bool silent = false, bool userRequestedFresh = false)
     {
@@ -265,9 +266,14 @@ public class HomePage : AppPage
         // background sync, which on iOS might be days away.
         if (Reconcile.Run(meter, result.Snapshot!, f?.DailyAvg ?? 0))
         {
-            PrepaidTracker.Sync.Record(meter, result.Snapshot);
+            PrepaidTracker.Sync.Record(meter, result.Snapshot!);
             Refresh();
         }
+
+        // The user asked for a fresh read and DESCO's limit is reached: say so, the same
+        // way the portal does. Not awaited, so the pull-to-refresh spinner can settle.
+        if (!silent && provider is DescoProvider q && q.QuotaBlocked)
+            _ = ShowQuotaPopup(meter, result.Snapshot);
     }
 
     // ---------------- render ----------------
@@ -594,7 +600,7 @@ public class HomePage : AppPage
         };
         head.Add(new Label { Text = L.S("currentBalance"), TextColor = Theme.Muted, FontSize = 13, VerticalOptions = LayoutOptions.Center }, 0, 0);
         head.Add(AccountChip(meter), 1, 0);
-        head.Add(SyncButton(snap), 2, 0);
+        head.Add(SyncButton(meter, snap), 2, 0);
         hs.Add(head);
 
         // A DESCO meter that has never been signed in can show nothing at all. Say so
@@ -745,18 +751,24 @@ public class HomePage : AppPage
         return card;
     }
 
+    /// <summary>The same message DESCO's own page shows when today's read is used up.</summary>
+    Task ShowQuotaPopup(Meter meter, Snapshot? snap)
+    {
+        var when = snap?.NextEligible ?? DateTime.Today.AddDays(1);
+        var meterNo = snap?.MeterNo is { Length: > 0 } mn ? mn : meter.Account;
+        return Modal.Info(Root, L.S("quotaTitle"),
+            L.S("quotaReachedMeter", meterNo,
+                when.ToString("d MMM yyyy, HH:mm", CultureInfo.InvariantCulture)));
+    }
+
     /// <summary>
     /// Small ↻ in the balance card, for people who never discover pull-to-refresh.
-    ///
-    /// DESCO rations live meter reads to about one a day. When the day's read is spent
-    /// the button goes quiet and explains why: a control that can only fail is worse
-    /// than a greyed one, and a user who taps it three times learns the app lies rather
-    /// than that the portal has a limit.
+    /// When DESCO says today's read is used up, the button goes quiet and a tap shows
+    /// the same limit message the portal shows, instead of doing nothing.
     /// </summary>
-    View SyncButton(Snapshot? snap)
+    View SyncButton(Meter meter, Snapshot? snap)
     {
-        var nextRead = snap?.NextEligible;
-        var blocked = nextRead is { } n && DateTime.Now < n;
+        var blocked = snap?.NextEligible is { } n && DateTime.Now < n;
         var icon = StrokeIcon(RefreshPath, blocked ? Theme.Faint : Theme.Green, 14, 1.6);
 
         var b = new Border
@@ -781,12 +793,7 @@ public class HomePage : AppPage
         {
             if (blocked)
             {
-                // Still a tap target: it explains the limit rather than doing nothing,
-                // which would read as a broken button.
-                var when = nextRead!.Value;
-                await Modal.Info(Root, L.S("refresh"),
-                    L.S("quotaReached", when.ToString("d MMM ") + L.T12(when.ToString("HH:mm")))
-                    + "\n\n" + L.S("quotaHint"));
+                await ShowQuotaPopup(meter, snap);
                 return;
             }
             Invalidate();
