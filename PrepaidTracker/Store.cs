@@ -307,19 +307,15 @@ public static class Store
                 .ToList();
         }
 
-        // Carry forward what the portal states only intermittently.
+        // Carry forward DESCO's live-read limit ONLY when this sync didn't hear DESCO's
+        // verdict at all (the cached realtime call failed). When it did, the fresh value
+        // is the truth — including null, which means "a read is available" — and an older
+        // stored limit must not come back over it and grey the button by mistake.
         //
-        // NextEligible is the moment DESCO will allow another live meter read. It comes
-        // back on the realtime-balance call and nowhere else, so a sync that fails after
-        // that point — or a NESCO sync overwriting a shared field — would drop it, the
-        // refresh button would unlock early, the request would be refused, and the user
-        // would learn that the control lies. Same class of bug as the year of monthly
-        // history that vanished after one failed sync.
-        //
-        // The guard is on the VALUE, not the sync: once the moment has passed there is
-        // nothing to preserve, so a stale limit can never outlive itself and jam the
-        // button shut.
-        if (s.NextEligible is null && prev?.NextEligible is { } priorLimit && priorLimit > DateTime.Now)
+        // The guard is also on the VALUE: once the moment has passed there is nothing to
+        // preserve, so a stale limit can never outlive itself and jam the button shut.
+        if (!s.QuotaKnown && s.NextEligible is null
+            && prev?.NextEligible is { } priorLimit && priorLimit > DateTime.Now)
             s.NextEligible = priorLimit;
 
         // Sanction load changes essentially never (it's the contracted load on the
