@@ -350,7 +350,7 @@ public class HomePage : AppPage
             chart.Content = UI.BarChart(bars, daily ? UI.ChartLabels.Weekday : UI.ChartLabels.Month);
             _body.Add(chart);
 
-            _body.Add(daily
+            _body.Add(daily && f != null
                 ? UI.TripleStatMixed(
                     f.Today != null
                         ? UI.Cell(L.S("today"), "৳ " + $"{f.Today:0}")
