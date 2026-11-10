@@ -111,10 +111,8 @@ public class DescoProvider : IProvider
     public SessionState LastState { get; private set; } = SessionState.Ok;
 
     /// <summary>
-    /// Request a fresh meter read this sync, spending one of the day's rationed reads.
-    /// Set by the pull-to-refresh path only; every background caller leaves it false.
-    /// Carried on the instance rather than the call because IProvider's signature is
-    /// shared with NescoProvider and changing it would ripple through every call site.
+    /// Request a fresh meter read this sync, spending that meter's daily read. Set by the
+    /// pull-to-refresh and ↻ paths only; every background caller leaves it false.
     /// </summary>
     public bool UserRequestedFresh { get; set; }
 
@@ -137,14 +135,10 @@ public class DescoProvider : IProvider
         var snap = new Snapshot { SyncedAt = DateTime.Now };
 
         // Snapshot.BalanceReported DEFAULTS TO TRUE, and on this portal a balance has to
-        // be earned. Leaving the default in place reports a phantom ৳0.00 — which reads
-        // as an empty meter, trips the low-balance banner, and would fire a notification
-        // off a number that never existed.
+        // be earned. Leaving the default in place reports a phantom ৳0.00.
         snap.BalanceReported = false;
 
         // ---- resolve the internal accountId -----------------------------------
-        // The POST path hangs off this, NOT off the account number the customer knows:
-        // /api/accounts/15539/… works, /api/accounts/41392222/… returns 403.
         long id;
         try { id = await api.AccountIdAsync(ct); }
         catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
@@ -152,8 +146,6 @@ public class DescoProvider : IProvider
 
         if (id <= 0)
         {
-            // Either the session is gone or the account isn't linked to this login.
-            // Both need the user; neither is retryable on its own.
             LastState = api.LastKnownState == SessionState.Ok
                 ? SessionState.NeedsLogin
                 : api.LastKnownState;
@@ -171,8 +163,6 @@ public class DescoProvider : IProvider
         Log("accounts", $"accountId {id}");
 
         // ---- summary: customer, address, sanction load -------------------------
-        // This call decides the session verdict: it is the first authenticated data call
-        // and the only one guaranteed to answer when the session is healthy.
         var (sum, st) = await api.GetAsync(root + Wire.LeafSummary, ct);
         if (st != SessionState.Ok)
         {
@@ -195,109 +185,27 @@ public class DescoProvider : IProvider
             snap.CustomerName = FirstString(sum.Value, "customerName");
             snap.Address = FirstString(sum.Value, "installationAddress");
             snap.MeterNo = FirstString(sum.Value, "meterNo");
-            // Reported as a STRING ("4"), so FirstOf's Providers.Num fallback parses it.
             snap.SanctionLoadKw = FirstOf(sum.Value, "sanctionLoad", "sanctionedLoad");
             Log("summary", "ok");
         }
         else Log("summary", "no data");
 
-        // ---- balance ------------------------------------------------------------
-        // There are TWO realtime-balance endpoints and the distinction is the design:
-        //
-        //   GET  /api/accounts/realtime-balance      ← collection-level, NO account id.
-        //        FREE. Returns the cached reading for every linked meter plus the quota
-        //        state. This is what the portal's own balance page calls.
-        //
-        //   POST /api/accounts/{id}/realtime-balance ← account-scoped. COMMANDS the
-        //        meter to take a new reading and spends the day's single allowance.
-        //
-        // A GET against the account-scoped path returns 500, which is what made this
-        // look broken. Take the free cached read on every sync; spend the live one only
-        // when the user asks and the quota allows.
-        var (all, balState) = await api.GetAsync(Wire.PathRealtimeAll, ct);
-        if (balState != SessionState.Ok) LastState = balState;
-
-        JsonElement? row = null;
-        if (all is not null
-            && all.Value.ValueKind == JsonValueKind.Object
-            && all.Value.TryGetProperty("meters", out var meters)
-            && meters.ValueKind == JsonValueKind.Array)
+        // ---- balance: the free cached read ----------------------------------------
+        if (await CachedRowAsync(api, account, ct) is { } cached)
         {
-            foreach (var m in meters.EnumerateArray())
-            {
-                // The onboarding field accepts an account number OR a meter number, so
-                // match either.
-                var no = FirstString(m, "accountNo");
-                var mn = FirstString(m, "meterNo");
-                if (string.Equals(no, account, StringComparison.OrdinalIgnoreCase)
-                    || string.Equals(mn, account, StringComparison.OrdinalIgnoreCase))
-                { row = m; break; }
-            }
-            // One linked meter and nothing matched: take it rather than show nothing.
-            if (row is null && meters.GetArrayLength() == 1) row = meters[0];
-        }
-
-        if (row is { } cached)
-        {
-            var balText = FirstString(cached, "lastRealtimeBalance", "balance");
-            if (balText.Length > 0)
-            {
-                snap.Balance = Providers.Num(balText);
-                snap.BalanceReported = true;
-                // UTC with a Z suffix: 03:05Z is 09:05 Dhaka, which is exactly what the
-                // portal displays. Never substitute the sync time — that would imply a
-                // liveness this figure does not have, and Forecast.Freshness and the
-                // live-estimate chip both depend on it being the real read moment.
-                snap.ReadingTime = ParseIso(FirstString(cached, "lastRealtimeReceivedAt"));
-            }
-            snap.NextEligible = ParseIso(FirstString(cached, "nextEligibleAt"));
-            if (snap.MeterNo.Length == 0) snap.MeterNo = FirstString(cached, "meterNo");
-
+            ApplyRow(snap, cached);
             Log("realtime(get)", snap.BalanceReported
                 ? $"cached ৳{snap.Balance:0.00} @ {snap.ReadingTime:g}"
                 : "no balance field");
         }
         else Log("realtime(get)", "no meter row");
 
-        // Only an explicit refresh spends a live read, and only once the quota allows.
-        var eligible = snap.NextEligible is not { } next || DateTime.Now >= next;
-
-        if (UserRequestedFresh && eligible)
-        {
-            var (fresh, fs) = await api.PostAsync(root + Wire.LeafRealtime, ct);
-            if (fs != SessionState.Ok) LastState = fs;
-
-            if (fresh is { } live)
-            {
-                // Recorded whether the call succeeded or was refused — a refusal is the
-                // only place the portal tells us when we may ask again.
-                if (ParseIso(FirstString(live, "nextEligibleAt")) is { } n) snap.NextEligible = n;
-
-                // Field name on a SUCCESSFUL post is still unverified — every probe so
-                // far has hit the daily limit. Candidates in order of likelihood; the
-                // cached GET above is the safety net either way.
-                var fb = FirstString(live, "balance", "lastRealtimeBalance", "currentBalance");
-                if (fb.Length > 0)
-                {
-                    snap.Balance = Providers.Num(fb);
-                    snap.BalanceReported = true;
-                    snap.ReadingTime = ParseIso(FirstString(live, "lastRealtimeReceivedAt",
-                                                                     "receivedAt", "readingTime"))
-                                           ?? DateTime.Now;
-                    Log("realtime(post)", "fresh read ok");
-                }
-                else
-                {
-                    // DAILY_LIMIT_REACHED / ALREADY_SUCCEEDED_TODAY means today's read
-                    // already happened, so the cached figure above IS current.
-                    var status = FirstString(live, "status");
-                    Log("realtime(post)", status.Length > 0 ? status : "200, no balance field");
-                }
-            }
-            else Log("realtime(post)", "POST failed");
-        }
-        else if (UserRequestedFresh)
-            Log("realtime(post)", "quota: not until " + (snap.NextEligible?.ToString("g") ?? "?"));
+        // ---- fresh read: only when the user explicitly asked ----------------------
+        // The cached GET's nextEligibleAt is NOT used to skip this. Trusting it made the
+        // app never send the POST, while the portal's own button worked. A refused POST
+        // costs nothing, so an explicit refresh always asks and the portal decides.
+        if (UserRequestedFresh)
+            await FreshReadAsync(api, root, account, snap, ct);
 
         // ---- transactions -------------------------------------------------------
         var from = DateTime.Now.AddDays(-365).ToString("yyyy-MM-dd");
@@ -315,16 +223,11 @@ public class DescoProvider : IProvider
                 if (amount <= 0) continue;
 
                 // The portal's own spelling, typo included: "Execution Successful" or
-                // "Not Returnd". Anything that isn't the success string is treated as a
-                // failure, which is the safe direction — a row wrongly called failed gets
-                // settled by the next meter read, whereas one wrongly called successful
-                // silently inflates the day's usage.
+                // "Not Returnd". Anything else is treated as a failure, the safe direction.
                 var orderStatus = FirstString(r, "orderStatus", "status");
                 var success = orderStatus.Equals("Execution Successful", StringComparison.OrdinalIgnoreCase);
 
-                // A meter key-change arrives as ONE transaction carrying a SET of tokens
-                // (twelve, under sequence "-3~9"). Reconcile must not settle that against
-                // a single balance rise — see CreditState.Informational.
+                // A meter key-change arrives as ONE transaction carrying a SET of tokens.
                 var tokens = FirstString(r, "token")
                     .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
 
@@ -333,8 +236,7 @@ public class DescoProvider : IProvider
                     Date = raw[..10],
                     Time = raw.Length >= 16 ? raw.Substring(11, 5) : "",
                     Amount = amount,
-                    // energyAmount already EXCLUDES the demand charge: ৳600 → ৳574.27
-                    // with none, ৳400 → ৳214.85 with ৳168 of it. Verified across 24 rows.
+                    // energyAmount already EXCLUDES the demand charge.
                     EnergyAmount = FirstOf(r, "energyAmount", "energy"),
                     DemandCharge = FirstOf(r, "demandCharge"),
                     OrderId = FirstString(r, "orderId"),
@@ -351,70 +253,144 @@ public class DescoProvider : IProvider
 
         snap.Recharges = snap.Recharges.OrderBy(r => r.Date, StringComparer.Ordinal).ToList();
 
-        // ---- what this portal does NOT give us ----------------------------------
-        // No monthly endpoint (/monthly, /monthly-consumption, /consumption, /usage all
-        // 404 under the account prefix) and no daily one. Months and Days stay empty, so
-        // Forecast falls through to its own-readings path: the daily series is derived
-        // from consecutive balance readings, which needs three distinct reads before the
-        // first bar appears. At one meter read a day, that is three days.
-        //
-        // There is also no month-to-date figure anywhere in this API — the old
-        // getBalance.currentMonthConsumption has no equivalent — so
-        // CurrentMonthConsumption stays 0 and FillMonth computes the month from our own
-        // rows rather than from an authoritative total.
+        // No monthly or daily endpoint on the new portal, and no month-to-date figure.
         Log("monthly", "no endpoint on new portal");
         Log("daily", "no endpoint on new portal");
 
         ProbeLog = string.Join("\n", _log);
 
-        // Only a total failure is an error. A missing balance with a working recharge
-        // history is a partial success — it is most of what the Usage tab needs.
         if (!snap.BalanceReported && snap.Recharges.Count == 0 && snap.CustomerName.Length == 0)
             return new FetchResult { Error = "No data returned.\n\n" + ProbeLog };
 
         return new FetchResult { Ok = true, Snapshot = snap };
     }
 
-    static double? Positive(double v) => v > 0 ? v : null;
+    // ---------------------------------------------------------------- balance helpers
+
+    /// <summary>This account's row from the free collection-level realtime-balance GET.</summary>
+    async Task<JsonElement?> CachedRowAsync(DescoApi api, string account, CancellationToken ct)
+    {
+        var (all, st) = await api.GetAsync(Wire.PathRealtimeAll, ct);
+        if (st != SessionState.Ok) { LastState = st; return null; }
+        if (all is not { ValueKind: JsonValueKind.Object } a
+            || !a.TryGetProperty("meters", out var meters)
+            || meters.ValueKind != JsonValueKind.Array) return null;
+
+        // The onboarding field accepts an account number OR a meter number.
+        foreach (var m in meters.EnumerateArray())
+            if (string.Equals(FirstString(m, "accountNo"), account, StringComparison.OrdinalIgnoreCase)
+                || string.Equals(FirstString(m, "meterNo"), account, StringComparison.OrdinalIgnoreCase))
+                return m;
+
+        // Guessing is only safe with ONE meter on the login. With two, a guess would
+        // show the other meter's balance under this account.
+        return meters.GetArrayLength() == 1 ? meters[0] : null;
+    }
+
+    /// <summary>Balance and read time from a cached realtime row. Deliberately does NOT
+    /// set NextEligible: only the POST's own answer may grey out the refresh button.</summary>
+    static void ApplyRow(Snapshot snap, JsonElement row)
+    {
+        var bal = FirstString(row, "lastRealtimeBalance", "balance");
+        if (bal.Length > 0)
+        {
+            snap.Balance = Providers.Num(bal);
+            snap.BalanceReported = true;
+            // UTC with a Z suffix → local. Never substitute the sync time.
+            snap.ReadingTime = ParseIso(FirstString(row, "lastRealtimeReceivedAt", "receivedAt"));
+        }
+        if (snap.MeterNo.Length == 0) snap.MeterNo = FirstString(row, "meterNo");
+    }
 
     /// <summary>
-    /// The row for this account out of the realtime-balance payload. The response is
-    /// { enabled, meters: [ … ] } — one entry per meter on the login, so a user with
-    /// two meters gets two, and matching on the account the user typed is the only way
-    /// to pick the right one. Falls back to the first entry, then to the bare object
-    /// in case a future shape drops the wrapper.
+    /// Ask the meter for a new reading. Confirmed shape: the POST answers in a few
+    /// seconds with {"status":"SUCCESS","balance":249.27,"receivedAt":"…Z",…} or with
+    /// {"status":"DAILY_LIMIT_REACHED","nextEligibleAt":"…Z",…}. The short poll at the
+    /// end is only a fallback for a SUCCESS-less reply we haven't seen yet.
     /// </summary>
-    static JsonElement? PickMeter(JsonElement root, string account)
+    async Task FreshReadAsync(DescoApi api, string root, string account, Snapshot snap, CancellationToken ct)
     {
-        if (root.ValueKind == JsonValueKind.Object
-            && root.TryGetProperty("meters", out var meters)
-            && meters.ValueKind == JsonValueKind.Array)
+        var before = snap.ReadingTime;
+
+        var (fresh, fs) = await api.PostAsync(root + Wire.LeafRealtime, ct);
+        if (fs != SessionState.Ok) { LastState = fs; Log("realtime(post)", fs.ToString()); return; }
+        if (fresh is not { } live) { Log("realtime(post)", "POST failed (non-2xx or unreadable)"); return; }
+
+        var status = FirstString(live, "status");
+        var reason = FirstString(live, "rateLimitReason");
+        var left = FirstString(live, "remainingAttempts");
+        var next = ParseIso(FirstString(live, "nextEligibleAt"));
+
+        // Refused: today's read for this meter is spent, so the cached figure IS current.
+        if (status.Contains("LIMIT", StringComparison.OrdinalIgnoreCase) || reason.Length > 0)
         {
-            JsonElement? first = null;
-            foreach (var m in meters.EnumerateArray())
-            {
-                first ??= m;
-                if (FirstString(m, "accountNo") == account || FirstString(m, "meterNo") == account)
-                    return m;
-            }
-            return first;
+            snap.NextEligible = next ?? NextDhakaMidnight();
+            Log("realtime(post)", $"{status} {reason}".Trim());
+            return;
         }
-        return root.ValueKind == JsonValueKind.Object ? root : null;
+
+        if (status.Contains("FAIL", StringComparison.OrdinalIgnoreCase)
+            || status.Contains("ERROR", StringComparison.OrdinalIgnoreCase))
+        {
+            Log("realtime(post)", status);
+            return;
+        }
+
+        // SUCCESS: the balance is in the reply.
+        var fb = FirstString(live, "balance", "lastRealtimeBalance", "currentBalance");
+        if (fb.Length > 0)
+        {
+            snap.Balance = Providers.Num(fb);
+            snap.BalanceReported = true;
+            snap.ReadingTime = ParseIso(FirstString(live, "receivedAt", "lastRealtimeReceivedAt", "readingTime"))
+                               ?? DateTime.Now;
+            // One successful read per meter per day: the portal refuses the next one
+            // until midnight Dhaka time, so grey the button until then.
+            snap.NextEligible = next ?? NextDhakaMidnight();
+            Log("realtime(post)", $"{(status.Length > 0 ? status : "ok")} ৳{snap.Balance:0.00}"
+                                  + (left.Length > 0 ? $", {left} attempt(s) left" : ""));
+            return;
+        }
+
+        // Accepted with no balance in the reply — not seen so far. Poll the free cached
+        // read briefly in case the meter reports a moment later.
+        Log("realtime(post)", (status.Length > 0 ? status : "accepted") + ", waiting for meter");
+        for (int i = 0; i < 6; i++)
+        {
+            await Task.Delay(TimeSpan.FromSeconds(5), ct);
+            if (await CachedRowAsync(api, account, ct) is not { } row) continue;
+
+            var t = ParseIso(FirstString(row, "lastRealtimeReceivedAt", "receivedAt"));
+            if (t is { } tt && (before is not { } b || tt > b))
+            {
+                ApplyRow(snap, row);
+                snap.NextEligible = next ?? NextDhakaMidnight();
+                Log("realtime(poll)", $"new read ৳{snap.Balance:0.00} @ {snap.ReadingTime:g}");
+                return;
+            }
+        }
+        Log("realtime(poll)", "meter did not answer within 30 s");
+    }
+
+    /// <summary>Next 00:00 in Dhaka (UTC+6), as device-local time.</summary>
+    static DateTime NextDhakaMidnight()
+    {
+        var dhakaNow = DateTime.UtcNow.AddHours(6);
+        var midnightUtc = dhakaNow.Date.AddDays(1).AddHours(-6);
+        return DateTime.SpecifyKind(midnightUtc, DateTimeKind.Utc).ToLocalTime();
     }
 
     /// <summary>
     /// ISO-8601 with a Z suffix → LOCAL time. The portal reports UTC; Dhaka is +6, so
-    /// treating these as local would shift every read time by six hours and make a
-    /// midnight read look like a 6am one.
+    /// treating these as local would shift every read time by six hours.
     /// </summary>
     static DateTime? ParseIso(string s) =>
         DateTimeOffset.TryParse(s, CultureInfo.InvariantCulture,
             DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal, out var d)
             ? d.LocalDateTime : null;
 
-    // --- JSON helpers. Same contracts as the previous DescoProvider: DESCO's wrapping
-    //     and field naming are both inconsistent, so never read one hardcoded name and
-    //     never assume a bare array. ---
+    // --- JSON helpers. DESCO's wrapping and field naming are both inconsistent, so
+    //     never read one hardcoded name and never assume a bare array. ---
 
     static IEnumerable<JsonElement> AsArray(JsonElement? e)
     {
