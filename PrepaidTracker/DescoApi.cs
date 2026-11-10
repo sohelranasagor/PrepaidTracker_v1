@@ -1,4 +1,4 @@
-﻿using System.Collections.Concurrent;
+using System.Collections.Concurrent;
 using System.Net;
 using System.Text;
 using System.Text.Json;
@@ -11,7 +11,8 @@ internal static class Wire
     public const string Base = "https://prepaid.desco.org.bd";
 
     // =====================================================================
-    // CONFIRMED by tools/DescoProbe against account 41392222, 2026-11-09.
+    // CONFIRMED by tools/DescoProbe against account 41392222, 2026-11-09,
+    // and by the portal's own network traffic, 2026-11-10.
     // =====================================================================
 
     // Answers 204 and sets the XSRF-TOKEN cookie. Note it is NOT under /api —
@@ -53,23 +54,23 @@ internal static class Wire
     // orderStatus ("Execution Successful" / "Not Returnd").
     public const string LeafTxns = "/transactions";   // ?dateFrom=yyyy-MM-dd&dateTo=yyyy-MM-dd
 
-    // POST ONLY — every GET returns 500, which is what made this look broken for a day.
+    // POST ONLY — every GET returns 500.
     //
-    // And the verb is the whole design: this endpoint is a COMMAND that asks the meter
-    // for a fresh reading, not a query against a cache. There is no free variant. So it
-    // must be called at most once a day, on explicit user action — an app that called it
-    // on every open would burn the allowance before the user ever pressed refresh.
+    // A COMMAND, not a query: it asks the meter for a fresh reading and spends that
+    // meter's daily allowance — one successful read per meter per day, the next one
+    // allowed after midnight Dhaka time. Each meter has its own allowance. Call it only
+    // on explicit user action.
     //
-    // A refusal answers 200 with:
+    // CONFIRMED 2026-11-10. Success answers in ~3 s with ONE JSON object (not a stream):
+    //   {"status":"SUCCESS","requestId":"…","meterNo":"…","meterType":"UNIFIED",
+    //    "balance":249.27,"requestedAt":"…Z","receivedAt":"…Z","source":"REALTIME",
+    //    "remainingAttempts":1}
+    // A refusal also answers 200:
     //   {"status":"DAILY_LIMIT_REACHED","meterNo":"…","source":"REALTIME",
     //    "nextEligibleAt":"2026-11-09T18:00:00Z","rateLimitReason":"ALREADY_SUCCEEDED_TODAY"}
     //
-    // ALREADY_SUCCEEDED_TODAY means today's read already happened, so whatever balance
-    // the app holds IS current — the refusal is not an error and must not blank it.
-    //
-    // UNVERIFIED: the shape of a SUCCESSFUL response. Today's read was already spent
-    // when probing, so only the refusal has been seen. The balance field name in
-    // DescoProvider is a guess with fallbacks until a probe run after midnight Dhaka.
+    // Every response ROTATES the XSRF-TOKEN cookie (cleared, then re-issued in the same
+    // response), so the header must always be read fresh from the jar, never cached.
     public const string LeafRealtime = "/realtime-balance";
 
     // =====================================================================
@@ -80,18 +81,20 @@ internal static class Wire
     // digging them out of the transaction rows, if it ever starts answering.
     public const string LeafTokens = "/tokens";
 
-    // No monthly endpoint found: /monthly, /monthly-consumption, /consumption and
-    // /usage all 404. The portal's own dashboard says "No monthly data yet" for this
-    // account, so it may genuinely not exist for UNIFIED meters.
+    // /balance 404s on UNIFIED meters — the portal's own page shows "The requested
+    // resource was not found" for it. Never called.
     //
-    // No daily endpoint either: /daily, /daily-consumption and /consumption/daily all
-    // 404. Snapshot.Days and Snapshot.Months therefore stay empty, and Forecast falls
-    // through to its own-readings path — which needs three distinct meter reads before
-    // the first chart bar appears. At one read a day, that is three days.
+    // No monthly endpoint found: /monthly, /monthly-consumption, /consumption and
+    // /usage all 404. No daily endpoint either: /daily, /daily-consumption and
+    // /consumption/daily all 404. Snapshot.Days and Snapshot.Months therefore stay
+    // empty, and Forecast falls through to its own-readings path.
 
-    // Collection-level and FREE: returns the cached reading for every linked meter plus
-    // the quota state. Different endpoint from the account-scoped POST below, which
-    // spends the day's allowance. A GET against that one returns 500.
+    // Collection-level and FREE: returns the cached reading for every linked meter.
+    // Different endpoint from the account-scoped POST above, which spends the day's
+    // allowance.
+    //
+    // Its nextEligibleAt is NOT used to decide whether to POST. Trusting it made the
+    // app skip the live read entirely while the portal's own button still worked.
     public const string PathRealtimeAll = "/api/accounts/realtime-balance";
 
     public static readonly TimeSpan SessionTtl = TimeSpan.FromMinutes(5);
@@ -397,23 +400,33 @@ public sealed class DescoApi : IDisposable
         {
             foreach (var a in arr.EnumerateArray())
             {
+                // ToString, not GetString: GetString THROWS if the portal ever sends the
+                // number unquoted, and that exception surfaced as "session expired".
                 if (a.TryGetProperty("accountNo", out var no)
-                    && string.Equals(no.GetString(), _account, StringComparison.OrdinalIgnoreCase)
-                    && a.TryGetProperty("accountId", out var id))
-                    return _accountId = id.GetInt64();
+                    && string.Equals(no.ToString(), _account, StringComparison.OrdinalIgnoreCase)
+                    && ReadId(a) is { } id)
+                    return _accountId = id;
             }
 
             // One linked account and the number didn't match: the user may have typed a
             // meter number, or the portal may render the account number differently.
             // Taking the only account beats failing outright.
-            if (arr.GetArrayLength() == 1 && arr[0].TryGetProperty("accountId", out var only))
-                return _accountId = only.GetInt64();
+            if (arr.GetArrayLength() == 1 && ReadId(arr[0]) is { } only)
+                return _accountId = only;
 
             // Several accounts and none matched — this login doesn't own that number.
             // NOT a session problem; a re-login would change nothing.
             LastKnownState = SessionState.Misconfigured;
         }
         return 0;
+    }
+
+    /// <summary>accountId as a number, whether the portal sends 15539 or "15539".</summary>
+    static long? ReadId(JsonElement a)
+    {
+        if (!a.TryGetProperty("accountId", out var id)) return null;
+        if (id.ValueKind == JsonValueKind.Number && id.TryGetInt64(out var n)) return n;
+        return long.TryParse(id.ToString(), out var s) ? s : null;
     }
 
     // ---- authed GET, with exactly one re-login retry ----
@@ -467,19 +480,29 @@ public sealed class DescoApi : IDisposable
     /// <summary>
     /// POST with the CSRF header. Used only for realtime-balance, which is a COMMAND —
     /// it asks the meter for a fresh reading — rather than a query. That is why it must
-    /// never be called speculatively: each call either spends the day's single allowance
-    /// or is refused with DAILY_LIMIT_REACHED.
+    /// never be called speculatively: each call either spends the day's allowance or is
+    /// refused with DAILY_LIMIT_REACHED.
     ///
-    /// Note the retry rule is the same single re-login as GetAsync, and it is safe here
-    /// for the same reason it would normally be dangerous on a POST: a refused call
-    /// changes nothing, and a successful one is idempotent within the day — the second
-    /// attempt simply reports ALREADY_SUCCEEDED_TODAY.
+    /// The retry rule is the same single re-login as GetAsync, and it is safe here: a
+    /// refused call changes nothing, and a second attempt after a success simply reports
+    /// ALREADY_SUCCEEDED_TODAY.
     /// </summary>
     public async Task<(JsonElement? Node, SessionState State)> PostAsync(
         string path, CancellationToken ct, bool isRetry = false)
     {
         var st = await EnsureAsync(ct);
         if (st != SessionState.Ok) return (null, st);
+
+        // The portal clears and re-issues XSRF-TOKEN on every response, and Spring can
+        // leave it absent straight after a login. A POST without the header is a 403,
+        // which the code below would read as a dead session and answer with a pointless
+        // re-login. Make sure a token is in the jar first.
+        if (Csrf() is null)
+        {
+            try { using (await _http.GetAsync(Wire.Base + Wire.PathCsrf, ct)) { } }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+            catch { }
+        }
 
         HttpResponseMessage res;
         try
