@@ -4,8 +4,6 @@ using UserNotifications;
 #endif
 #if ANDROID
 using AndroidX.Work;
-using System.Security.Permissions;
-using static System.Runtime.InteropServices.JavaScript.JSType;
 #endif
 
 namespace PrepaidTracker;
