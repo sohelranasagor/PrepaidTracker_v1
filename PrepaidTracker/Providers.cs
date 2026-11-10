@@ -75,31 +75,31 @@ public static class Providers
 // DESCO — authenticated session API (new portal, November 2026).
 //
 // The old unauthenticated api/tkdes/customer/* family is gone. DESCO rebuilt the
-// portal with a login — their own notice says authentication was added to protect
-// customer data — so every call now rides a session cookie obtained by DescoApi.
+// portal with a login, so every call now rides a session cookie obtained by DescoApi.
 //
-// Endpoints, as observed on the new portal:
+// Endpoints, CONFIRMED against the portal's own traffic (2026-11-10):
 //
-//   realtime-balance   balance + the live-read quota state
-//   summary            month-to-date, sanction load, customer details
-//   monthly            finished months
-//   transactions       recharges, with energyAmount, demandCharge and STS tokens
+//   GET  /api/accounts                       accountId for each linked account
+//   GET  /api/accounts/{id}/summary          customer, address, sanction load
+//   GET  /api/accounts/realtime-balance      FREE: cached balance for every meter on
+//                                            the login + DESCO's verdict on today's
+//                                            live read (status, nextEligibleAt)
+//   POST /api/accounts/{id}/realtime-balance asks the meter for a NEW reading;
+//                                            one successful read per meter per day
+//   GET  /api/accounts/{id}/transactions     recharges, energyAmount, demandCharge,
+//                                            STS tokens
 //
-// Three facts shape everything below:
+// Facts that shape everything below:
 //
-//   1. LIVE READS ARE RATIONED — roughly one a day, after which the portal answers
-//      status DAILY_LIMIT_REACHED and names a nextEligibleAt. So an ordinary sync
-//      NEVER requests a fresh read: it uses lastRealtimeBalance, which is free and is
-//      the same midnight-snapshot figure the old getBalance returned. Only an explicit
-//      user refresh spends an attempt, and only once nextEligibleAt has passed. The old
-//      "sync on every app open" habit would exhaust the day's allowance before noon.
+//   1. CHECK FIRST, THEN ASK. Exactly like the portal's own page: the free GET says
+//      whether this meter's read for today is used up. If it is, nothing is sent and
+//      the page shows DESCO's limit message. Only an explicit user refresh ever POSTs.
 //
-//   2. THEIR OWN /balance ENDPOINT 404s on UNIFIED meters — their portal renders "The
-//      requested resource was not found" in its own UI. We don't call it.
+//   2. /balance 404s on UNIFIED meters — the portal's own page shows "The requested
+//      resource was not found". We don't call it.
 //
-//   3. NO DAILY FEED has been located on the new portal. Snapshot.Days therefore stays
-//      empty and Forecast falls through to the monthly total, then to our own readings.
-//      At ~1 read/day that needs three syncs before the first derived bar appears.
+//   3. NO DAILY or MONTHLY FEED on the new portal. Snapshot.Days and Months stay empty
+//      and Forecast falls through to our own readings.
 // ---------------------------------------------------------------------------
 public class DescoProvider : IProvider
 {
@@ -116,6 +116,10 @@ public class DescoProvider : IProvider
     /// </summary>
     public bool UserRequestedFresh { get; set; }
 
+    /// <summary>True when the user asked for a fresh read but DESCO's daily limit for
+    /// this meter is reached. HomePage shows the limit popup when it sees this.</summary>
+    public bool QuotaBlocked { get; private set; }
+
     /// <summary>What happened last sync, for Profile → Diagnostics.</summary>
     public static string ProbeLog { get; private set; } = "";
 
@@ -130,6 +134,7 @@ public class DescoProvider : IProvider
     {
         _log.Clear();
         LastState = SessionState.Ok;
+        QuotaBlocked = false;
 
         var api = DescoApi.For(account);
         var snap = new Snapshot { SyncedAt = DateTime.Now };
@@ -185,12 +190,13 @@ public class DescoProvider : IProvider
             snap.CustomerName = FirstString(sum.Value, "customerName");
             snap.Address = FirstString(sum.Value, "installationAddress");
             snap.MeterNo = FirstString(sum.Value, "meterNo");
+            // Reported as a STRING ("4"), so FirstOf's Providers.Num fallback parses it.
             snap.SanctionLoadKw = FirstOf(sum.Value, "sanctionLoad", "sanctionedLoad");
             Log("summary", "ok");
         }
         else Log("summary", "no data");
 
-        // ---- balance: the free cached read ----------------------------------------
+        // ---- balance: the free cached read (also DESCO's verdict on today's read) --
         if (await CachedRowAsync(api, account, ct) is { } cached)
         {
             ApplyRow(snap, cached);
@@ -201,11 +207,18 @@ public class DescoProvider : IProvider
         else Log("realtime(get)", "no meter row");
 
         // ---- fresh read: only when the user explicitly asked ----------------------
-        // The cached GET's nextEligibleAt is NOT used to skip this. Trusting it made the
-        // app never send the POST, while the portal's own button worked. A refused POST
-        // costs nothing, so an explicit refresh always asks and the portal decides.
+        // Check first, exactly like the portal's own page: the cached row above carries
+        // DESCO's verdict (status DAILY_LIMIT_REACHED + nextEligibleAt). Limited → don't
+        // send anything, just flag it so the page can show the popup.
         if (UserRequestedFresh)
-            await FreshReadAsync(api, root, account, snap, ct);
+        {
+            if (snap.NextEligible is { } until && DateTime.Now < until)
+            {
+                QuotaBlocked = true;
+                Log("realtime(post)", $"skipped: limit reached until {until:g}");
+            }
+            else await FreshReadAsync(api, root, account, snap, ct);
+        }
 
         // ---- transactions -------------------------------------------------------
         var from = DateTime.Now.AddDays(-365).ToString("yyyy-MM-dd");
@@ -223,11 +236,16 @@ public class DescoProvider : IProvider
                 if (amount <= 0) continue;
 
                 // The portal's own spelling, typo included: "Execution Successful" or
-                // "Not Returnd". Anything else is treated as a failure, the safe direction.
+                // "Not Returnd". Anything that isn't the success string is treated as a
+                // failure, which is the safe direction — a row wrongly called failed gets
+                // settled by the next meter read, whereas one wrongly called successful
+                // silently inflates the day's usage.
                 var orderStatus = FirstString(r, "orderStatus", "status");
                 var success = orderStatus.Equals("Execution Successful", StringComparison.OrdinalIgnoreCase);
 
-                // A meter key-change arrives as ONE transaction carrying a SET of tokens.
+                // A meter key-change arrives as ONE transaction carrying a SET of tokens
+                // (twelve, under sequence "-3~9"). Reconcile must not settle that against
+                // a single balance rise — see CreditState.Informational.
                 var tokens = FirstString(r, "token")
                     .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
 
@@ -236,7 +254,8 @@ public class DescoProvider : IProvider
                     Date = raw[..10],
                     Time = raw.Length >= 16 ? raw.Substring(11, 5) : "",
                     Amount = amount,
-                    // energyAmount already EXCLUDES the demand charge.
+                    // energyAmount already EXCLUDES the demand charge: ৳600 → ৳574.27
+                    // with none, ৳400 → ৳214.85 with ৳168 of it. Verified across 24 rows.
                     EnergyAmount = FirstOf(r, "energyAmount", "energy"),
                     DemandCharge = FirstOf(r, "demandCharge"),
                     OrderId = FirstString(r, "orderId"),
@@ -253,12 +272,17 @@ public class DescoProvider : IProvider
 
         snap.Recharges = snap.Recharges.OrderBy(r => r.Date, StringComparer.Ordinal).ToList();
 
-        // No monthly or daily endpoint on the new portal, and no month-to-date figure.
+        // ---- what this portal does NOT give us ----------------------------------
+        // No monthly endpoint and no daily one. Months and Days stay empty, so Forecast
+        // falls through to its own-readings path. There is also no month-to-date figure,
+        // so CurrentMonthConsumption stays 0.
         Log("monthly", "no endpoint on new portal");
         Log("daily", "no endpoint on new portal");
 
         ProbeLog = string.Join("\n", _log);
 
+        // Only a total failure is an error. A missing balance with a working recharge
+        // history is a partial success — it is most of what the Usage tab needs.
         if (!snap.BalanceReported && snap.Recharges.Count == 0 && snap.CustomerName.Length == 0)
             return new FetchResult { Error = "No data returned.\n\n" + ProbeLog };
 
@@ -287,8 +311,15 @@ public class DescoProvider : IProvider
         return meters.GetArrayLength() == 1 ? meters[0] : null;
     }
 
-    /// <summary>Balance and read time from a cached realtime row. Deliberately does NOT
-    /// set NextEligible: only the POST's own answer may grey out the refresh button.</summary>
+    /// <summary>
+    /// Balance, read time and DESCO's own verdict on today's live read from a cached
+    /// realtime row. Confirmed shape (2026-11-10):
+    ///   { accountId, accountNo, meterNo, meterType, status: "DAILY_LIMIT_REACHED",
+    ///     message, lastRealtimeBalance, lastRealtimeReceivedAt, nextEligibleAt,
+    ///     attemptsToday, remainingAttempts }
+    /// One SUCCESSFUL read locks the meter until midnight Dhaka time even when
+    /// remainingAttempts is still above zero, so status is the authority.
+    /// </summary>
     static void ApplyRow(Snapshot snap, JsonElement row)
     {
         var bal = FirstString(row, "lastRealtimeBalance", "balance");
@@ -300,13 +331,22 @@ public class DescoProvider : IProvider
             snap.ReadingTime = ParseIso(FirstString(row, "lastRealtimeReceivedAt", "receivedAt"));
         }
         if (snap.MeterNo.Length == 0) snap.MeterNo = FirstString(row, "meterNo");
+
+        var status = FirstString(row, "status");
+        var left = FirstString(row, "remainingAttempts");
+        var limited = status.Contains("LIMIT", StringComparison.OrdinalIgnoreCase) || left == "0";
+
+        snap.NextEligible = limited
+            ? ParseIso(FirstString(row, "nextEligibleAt")) ?? NextDhakaMidnight()
+            : null;
+        snap.QuotaKnown = true;   // this sync heard DESCO's verdict, even if it's "not limited"
     }
 
     /// <summary>
     /// Ask the meter for a new reading. Confirmed shape: the POST answers in a few
     /// seconds with {"status":"SUCCESS","balance":249.27,"receivedAt":"…Z",…} or with
     /// {"status":"DAILY_LIMIT_REACHED","nextEligibleAt":"…Z",…}. The short poll at the
-    /// end is only a fallback for a SUCCESS-less reply we haven't seen yet.
+    /// end is only a fallback for a reply without a balance, which hasn't been seen.
     /// </summary>
     async Task FreshReadAsync(DescoApi api, string root, string account, Snapshot snap, CancellationToken ct)
     {
@@ -324,6 +364,7 @@ public class DescoProvider : IProvider
         // Refused: today's read for this meter is spent, so the cached figure IS current.
         if (status.Contains("LIMIT", StringComparison.OrdinalIgnoreCase) || reason.Length > 0)
         {
+            QuotaBlocked = true;
             snap.NextEligible = next ?? NextDhakaMidnight();
             Log("realtime(post)", $"{status} {reason}".Trim());
             return;
