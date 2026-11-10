@@ -78,7 +78,7 @@ public static class BackgroundSync
 
             var next = (OneTimeWorkRequest)new OneTimeWorkRequest.Builder(
                     Java.Lang.Class.FromType(typeof(SyncWorker)))
-                .SetInitialDelay((long)delay.TotalMinutes, Java.Util.Concurrent.TimeUnit.Minutes!)
+                .SetInitialDelay((long)delay.TotalMinutes, Java.Util.Concurrent.TimeUnit.Minutes!)!
                 .SetConstraints(new Constraints.Builder()
                     .SetRequiredNetworkType(NetworkType.Connected!)
                     .Build()!)
