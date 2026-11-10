@@ -64,14 +64,14 @@ public static class L
         ["authNeeded"] = ("Sign in to see this meter's balance.",
                                "এই মিটারের ব্যালেন্স দেখতে সাইন ইন করুন."),
 
-        // ---- the live-read quota ----
-        // DESCO rations fresh meter readings to roughly one a day. Everything else the
-        // app shows comes from their cached figure and costs nothing, so this only ever
-        // appears on the manual refresh control.
+        // ---- the live-read limit ----
+        // DESCO allows one successful fresh meter reading per meter per day. Everything
+        // else the app shows comes from their cached figure and costs nothing, so this
+        // only ever appears on a manual refresh. Same wording as DESCO's own page.
         ["refresh"] = ("Refresh", "রিফ্রেশ"),
-        ["quotaReached"] = ("Next reading after {0}", "পরবর্তী রিডিং {0} এর পর"),
-        ["quotaHint"] = ("DESCO allows about one fresh meter reading a day. The balance shown is their latest.",
-                               "ডেসকো দিনে একবারের মতো নতুন মিটার রিডিং দেয়। দেখানো ব্যালেন্স তাদের সর্বশেষ।"),
+        ["quotaTitle"] = ("Realtime balance", "রিয়েলটাইম ব্যালেন্স"),
+        ["quotaReachedMeter"] = ("Today's realtime balance request limit for meter {0} has been reached.\nYou can request another reading after {1}.",
+                                 "মিটার {0}-এর আজকের রিয়েলটাইম ব্যালেন্স অনুরোধের সীমা শেষ হয়েছে।\n{1}-এর পর আবার রিডিং নিতে পারবেন।"),
 
         // home
         ["welcome"] = ("Welcome", "স্বাগতম"),
