@@ -36,11 +36,30 @@ public class App : Application
         Access.StartWatch();
     }
 
+    /// <summary>
+    /// Coming back from the background — possibly hours later, possibly the next day.
+    ///
+    /// A phone that keeps the app in memory overnight RESUMES it rather than relaunching
+    /// it, and a resume never calls the Home page's OnAppearing. So without this the
+    /// screen showed yesterday's balance, yesterday's "N h ago", and a refresh button
+    /// still faded from yesterday's limit, until the user happened to pull down.
+    ///
+    /// The Home page repaints and runs a silent CACHED sync — free, never spends DESCO's
+    /// live read. If the DESCO session expired overnight, that sync signs in again with
+    /// the saved password on the way, with no prompt.
+    /// </summary>
+    protected override void OnResume()
+    {
+        base.OnResume();
+        Access.StartWatch();
+
+        if (Shell.Current?.CurrentPage is HomePage home) _ = home.ResumeAsync();
+    }
+
     // The 5-second poll only makes sense while someone is looking at the screen. iOS
     // suspends the process shortly after OnSleep anyway; leaving the timer running just
     // burns battery and wakes the server for nothing.
-    protected override void OnResume() { base.OnResume(); Access.StartWatch(); }
-    protected override void OnSleep()  { base.OnSleep();  Access.StopWatch(); }
+    protected override void OnSleep() { base.OnSleep(); Access.StopWatch(); }
 }
 
 public class AppShell : Shell
@@ -247,18 +266,6 @@ public static class UI
     public enum ChartLabels { Weekday, Month, DayNumber }
 
     /// <summary>
-    /// Bar chart: gradient bars, weekday/month labels, and a callout over the selected
-    /// bar. The newest bar is selected on open; tapping any bar moves the callout to it.
-    ///
-    /// Painted on a canvas rather than laid out. The previous version built each bar as
-    /// a contentless Border in a Star-sized Grid column, and a Border with no Content
-    /// desires 0 x 0 — so when Android measured the grid with an unconstrained width the
-    /// Star columns collapsed to that desired width and every bar arranged about a pixel
-    /// wide. iOS never took that measure path, which is why it only showed on device.
-    /// Arithmetic has no measure pass to lose, and it is what makes hit-testing a tap
-    /// back to a bar index a two-line job rather than a gesture per Border.
-    /// </summary>
-    /// <summary>
     /// Right-align the days we have inside a fixed number of slots, filling the empty
     /// left with dashed placeholders. Two real days in a 7-slot chart draw as five empty
     /// outlines then two bars, so the chart keeps a constant width and visibly fills in as
@@ -308,6 +315,18 @@ public static class UI
         return result;
     }
 
+    /// <summary>
+    /// Bar chart: gradient bars, weekday/month labels, and a callout over the selected
+    /// bar. The newest bar is selected on open; tapping any bar moves the callout to it.
+    ///
+    /// Painted on a canvas rather than laid out. The previous version built each bar as
+    /// a contentless Border in a Star-sized Grid column, and a Border with no Content
+    /// desires 0 x 0 — so when Android measured the grid with an unconstrained width the
+    /// Star columns collapsed to that desired width and every bar arranged about a pixel
+    /// wide. iOS never took that measure path, which is why it only showed on device.
+    /// Arithmetic has no measure pass to lose, and it is what makes hit-testing a tap
+    /// back to a bar index a two-line job rather than a gesture per Border.
+    /// </summary>
     public static View BarChart(List<DayRow> days, ChartLabels mode = ChartLabels.Weekday,
                                 double height = 130, bool showAverage = false)
     {
