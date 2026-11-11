@@ -19,13 +19,10 @@ namespace PrepaidTracker;
 ///      measurement, and inventing one would corrupt the interval arithmetic and leave
 ///      Unverified verdicts with no read dated after them.
 ///
-///   2. A QUOTA on live meter reads — roughly one per day per meter, after which the
-///      portal answers DAILY_LIMIT_REACHED. So background callers leave
+///   2. A QUOTA on live meter reads — one successful read per day per meter, after which
+///      the portal answers DAILY_LIMIT_REACHED. So background callers leave
 ///      userRequestedFresh false and read the portal's CACHED figure, which costs
-///      nothing and is the same midnight-snapshot balance the old API returned. Only an
-///      explicit pull-to-refresh spends an attempt. Syncing live on every app open —
-///      what this app used to do — would exhaust the day's allowance before noon and
-///      leave the user unable to refresh at the moment it mattered.
+///      nothing. Only an explicit pull-to-refresh spends an attempt.
 /// </summary>
 public static class Sync
 {
@@ -64,9 +61,7 @@ public static class Sync
 
             // The session is gone and only the user can restore it. Checked BEFORE the
             // result.Ok test, because an auth failure arrives as a plain failed fetch and
-            // would otherwise be indistinguishable from the portal being down — which is
-            // the one thing the user must be told apart, since one needs a tap and the
-            // other needs patience.
+            // would otherwise be indistinguishable from the portal being down.
             if (provider is DescoProvider auth && auth.LastState == SessionState.NeedsLogin)
             {
                 Notifier.SessionExpired(meter);
@@ -76,11 +71,9 @@ public static class Sync
 
             if (!result.Ok || result.Snapshot == null) continue;
 
-            // The portal reports the connection's sanction load, and the demand charge it
-            // predicts is worth real money in the recharge suggestion. Cache it on the
-            // meter so a sync where the summary endpoint didn't answer doesn't silently
-            // drop the suggestion back to its fallback path. Written only on change —
-            // this runs on every background wake and meters.json is rewritten whole.
+            // Cache the sanction load on the meter so a sync where the summary endpoint
+            // didn't answer doesn't silently drop the suggestion back to its fallback
+            // path. Written only on change — meters.json is rewritten whole.
             if (result.Snapshot.SanctionLoadKw > 0
                 && Math.Abs(meter.SanctionLoadKw - result.Snapshot.SanctionLoadKw) > 0.01)
             {
@@ -94,11 +87,8 @@ public static class Sync
 
             // Settle every failed recharge this read has now overtaken. When one turns
             // out to have landed after all, the reading we just banked was computed as if
-            // it hadn't: spent = prev + 0 - new goes NEGATIVE and Forecast drops the whole
-            // day. So bank it again with the credit counted. Record is idempotent —
-            // AddReading replaces the row for that date — so the second call is a
-            // correction, not a duplicate, and it only happens on the one sync that
-            // settles a verdict.
+            // it hadn't, so bank it again with the credit counted. Record is idempotent —
+            // AddReading replaces the row for that date.
             if (Reconcile.Run(meter, result.Snapshot, f?.DailyAvg ?? 0))
             {
                 Record(meter, result.Snapshot);
@@ -114,8 +104,7 @@ public static class Sync
         }
 
         // A partial success is still a success: one DESCO account needing a login must
-        // not report the whole sync as broken when a NESCO meter updated fine. The
-        // expired session was already surfaced by its own notification.
+        // not report the whole sync as broken when a NESCO meter updated fine.
         if (any) return SyncOutcome.Ok;
         return authNeeded ? SyncOutcome.AuthRequired : SyncOutcome.Failed;
     }
@@ -123,8 +112,7 @@ public static class Sync
     /// <summary>
     /// Cache the snapshot and keep our own reading log. The log is what the forecast is
     /// built from whenever the utility publishes no daily figure — which is always for
-    /// NESCO, and now also for DESCO, whose rebuilt portal exposes no daily endpoint we
-    /// have located. A day the app never saw is a day that does not exist.
+    /// NESCO, and now also for DESCO. A day the app never saw is a day that does not exist.
     /// </summary>
     public static void Record(Meter meter, Snapshot snap)
     {
@@ -135,57 +123,47 @@ public static class Sync
         // one of those poisons the own-readings forecast for days.
         if (!snap.BalanceReported) return;
 
-        // Date the reading by the meter's OWN read time, not our sync clock. The balance
-        // we just stored is the meter's figure as of ReadingTime — DESCO's
-        // lastRealtimeReceivedAt, NESCO's (সময়ঃ …) caption — so a reading whose
-        // ReadingTime is "15 Jul 12:00 AM" belongs to the 15th no matter what hour we
-        // happened to sync. Dating it by the sync clock instead put the same midnight
-        // balance under two different dates when the user synced twice across a day the
-        // meter never re-read, banking a phantom ৳0 day, and shifted the derived daily
-        // bars off by a day. Fall back to the sync date only when the portal gives no
-        // read time.
+        // Date the reading by the meter's OWN read time, not our sync clock. Dating it by
+        // the sync clock put the same balance under two different dates when the user
+        // synced twice across a day the meter never re-read, banking a phantom ৳0 day.
+        // Fall back to the sync date only when the portal gives no read time.
         var readingDate = (snap.ReadingTime ?? DateTime.Now).ToString("yyyy-MM-dd");
+
+        // ReadAt is stored too. NESCO reads at midnight, so the date alone was enough to
+        // say whether a recharge was inside a balance. DESCO's live read happens at any
+        // hour: a recharge at 08:00 is already inside a 09:05 read on the same day, and
+        // the date-only rule counted it a second time in the NEXT interval.
+        var current = new Reading { Date = readingDate, ReadAt = snap.ReadingTime, Balance = snap.Balance };
+
         var prior = Store.Readings(meter.Id)
             .LastOrDefault(r => string.Compare(r.Date, readingDate, StringComparison.Ordinal) < 0);
 
-        // Money that actually reached the meter: the ones the portal called successful,
-        // plus the ones it called FAILED that a later read proved landed anyway (see
-        // Reconcile). A failed row is not evidence of anything on its own — but once a
-        // reading has risen by the recharge's energy, refusing to count it here is
-        // exactly what pushes `spent` negative and makes Forecast drop the day.
+        // Money that actually reached the meter between the previous read and this one:
+        // the rows the portal called successful, plus the ones it called FAILED that a
+        // later read proved landed anyway (see Reconcile).
         //
-        // MULTI-TOKEN rows are excluded even when the portal marks them successful. DESCO
-        // emits a meter key-change as one transaction carrying a SET of tokens (sequence
-        // "-3~9", twelve of them); its Amount is not a single credit against a single
-        // balance rise, so adding it here would inflate `spent` by hundreds of taka and
-        // then push the real day negative — the same failure as the two bugs above,
-        // reached from a third direction.
+        // MULTI-TOKEN rows are excluded even when the portal marks them successful: a
+        // meter key-change's Amount is not a single credit against a single balance rise.
         //
-        // The window is bounded on BOTH sides, and that matters because balances are
-        // midnight snapshots. A recharge dated D happens DURING day D — hours after that
-        // day's midnight read — so it is NOT in the balance dated D; it first shows up in
-        // the balance dated D+1. Attributing it to the interval that ENDS at D's midnight
-        // (the old open-ended "> prior.Date" rule did exactly that for a same-day
-        // recharge) adds the recharge to `spent` while the balance hasn't risen yet,
-        // inflating that one bar by the whole recharge amount and then pushing the real
-        // recharge-day usage negative so Forecast drops it. Counting only recharges in
-        // [prior.Date, readingDate) attributes each recharge to the first interval whose
-        // ending balance actually reflects it; consecutive intervals stay contiguous and
-        // non-overlapping.
-        double recharge = prior == null
+        // The window is "after the previous read, not after this one", decided by MOMENT
+        // where both the recharge time and the read time are known (Forecast.After), and
+        // by date otherwise — the original midnight rule, so readings saved by older builds
+        // behave exactly as before.
+        //
+        // ENERGY credited, not the amount paid. The balance rises by energy — ৳1,000 paid
+        // credits ৳957.12, or ৳789.12 on the month's first recharge — so counting the gross
+        // amount overstated `spent` for every interval with a recharge in it. That inflated
+        // the daily rate, shortened days-left, and the recharge suggestion then grossed the
+        // inflated rate up a second time.
+        current.Recharge = prior == null
             ? 0
             : snap.Recharges
                   .Where(r => !r.MultiToken
                            && (r.Success || Reconcile.IsCredited(meter.Id, r))
-                           && string.Compare(r.Date, prior.Date, StringComparison.Ordinal) >= 0
-                           && string.Compare(r.Date, readingDate, StringComparison.Ordinal) < 0)
-                  .Sum(r => r.Amount);
+                           && Forecast.After(r, prior)
+                           && !Forecast.After(r, current))
+                  .Sum(r => Reconcile.Energy(r, snap));
 
-        Store.AddReading(meter.Id, new Reading
-        {
-            Date = readingDate,
-            Balance = snap.Balance,
-            Recharge = recharge
-        });
+        Store.AddReading(meter.Id, current);
     }
 }
