@@ -37,24 +37,19 @@ public class Meter
     /// alerting after the upgrade; turned off by the user from the notification
     /// settings modal. When false, the meter is skipped by both the live check
     /// and the queued reminder, and any reminders the OS is already holding for
-    /// it are cancelled at flip time — otherwise a "turn off" wouldn't take
-    /// effect until the next fire.
+    /// it are cancelled at flip time.
     /// </summary>
     public bool NotificationsEnabled { get; set; } = true;
 
     /// <summary>
     /// Per-meter balance threshold, in taka. 0 (the JSON default for a missing
-    /// field) means "inherit from <see cref="Store.LowTaka"/>". Users only get
-    /// a concrete value here when they override it in the settings sheet — so
-    /// existing meters after an upgrade keep alerting at exactly the same taka
-    /// figure they did yesterday, and changing the app-wide default still
-    /// propagates to every meter that hasn't been customised.
+    /// field) means "inherit from <see cref="Store.LowTaka"/>".
     /// </summary>
     public int LowTaka { get; set; } = 0;
 
     /// <summary>
     /// Per-meter days-left threshold. Same 0-means-inherit convention as
-    /// <see cref="LowTaka"/>; see that comment for the reasoning.
+    /// <see cref="LowTaka"/>.
     /// </summary>
     public int LowDays { get; set; } = 0;
 
@@ -69,9 +64,7 @@ public class Meter
     ///     energyAmount = totalAmount × 0.95712 − demandCharge − meterRent
     ///
     /// held exactly, with demandCharge = ৳168 = 4 kW × ৳42 on exactly the first
-    /// recharge of Jun, Jul, Aug, Sep, Oct and Nov. Knowing the load therefore lets
-    /// the recharge suggestion gross up correctly instead of medianing over months
-    /// where a demand charge quietly ate ৳168 of the credit.
+    /// recharge of Jun, Jul, Aug, Sep, Oct and Nov.
     ///
     /// Cached on the meter rather than read per-sync so the suggestion still works
     /// on a sync where the summary endpoint didn't answer. When 0, Forecast falls
@@ -88,12 +81,22 @@ public class Meter
     public int EffectiveLowDays => LowDays > 0 ? LowDays : Store.LowDays;
 }
 
-/// <summary>A balance we observed ourselves. Used for NESCO, where there's no daily feed.</summary>
+/// <summary>A balance we observed ourselves. The forecast is built from these whenever the utility publishes no daily feed.</summary>
 public class Reading
 {
     public string Date { get; set; } = "";
     public double Balance { get; set; }
+
+    /// <summary>Energy credited to the meter since the previous reading, in taka.</summary>
     public double Recharge { get; set; }
+
+    /// <summary>
+    /// When the meter was actually read. DESCO's live read can happen at any hour, so the
+    /// date alone can't say whether a same-day recharge is already inside this balance.
+    /// Null for readings saved by older builds; those keep the old date-only rule
+    /// (see Forecast.After).
+    /// </summary>
+    public DateTime? ReadAt { get; set; }
 }
 
 public class RechargeRow
@@ -108,17 +111,14 @@ public class RechargeRow
     /// <summary>
     /// The portal's own order id ("0000000750633318"). Genuinely stable across syncs,
     /// unlike <see cref="Reconcile.KeyOf"/>'s content hash — but NOT used as the verdict
-    /// key, because switching the key orphans every verdict already on disk and would
-    /// re-raise banners and re-fire notifications for rows settled weeks ago. Kept for
+    /// key, because switching the key orphans every verdict already on disk. Kept for
     /// diagnostics and as the migration target if that is ever done deliberately.
     /// </summary>
     public string OrderId { get; set; } = "";
 
     /// <summary>
     /// Demand charge bundled into this recharge, when the portal itemises it. DESCO
-    /// levies it on the first recharge of a calendar month. It is NOT energy: counting
-    /// it as such is what made the observed credit ratio look like it varied wildly
-    /// (a ৳990 recharge crediting ৳781.35 instead of the usual ৳947.55).
+    /// levies it on the first recharge of a calendar month. It is NOT energy.
     /// </summary>
     public double DemandCharge { get; set; }
 
@@ -162,10 +162,9 @@ public class MonthRow
 
     /// <summary>
     /// True when this row was SYNTHESISED from the running month's total rather than
-    /// published as a finished month by the utility (see DescoProvider). It is a partial
-    /// month-to-date wearing a month row's clothes, and it must never be carried across
-    /// a sync into the next month, where it would harden into a completed month that is
-    /// simply wrong. <see cref="Store.SaveSnapshot"/> drops these rather than merging them.
+    /// published as a finished month by the utility. It must never be carried across
+    /// a sync into the next month. <see cref="Store.SaveSnapshot"/> drops these rather
+    /// than merging them.
     /// </summary>
     public bool Estimated { get; set; }
 }
@@ -176,9 +175,7 @@ public class Snapshot
     public double Balance { get; set; }
 
     /// <summary>
-    /// False when the utility answered but included no balance figure — DESCO's
-    /// unified (smart-meter) accounts often do this; even their own portal shows
-    /// recharge history without a remaining-balance number.
+    /// False when the utility answered but included no balance figure.
     /// </summary>
     public bool BalanceReported { get; set; } = true;
 
@@ -186,15 +183,14 @@ public class Snapshot
     public string CustomerName { get; set; } = "";
     public string Address { get; set; } = "";
 
-    /// <summary>When the utility last read the meter. DESCO's balance can be up to 24h stale.</summary>
+    /// <summary>When the utility last read the meter. On DESCO, the last live read.</summary>
     public DateTime? ReadingTime { get; set; }
 
     /// <summary>
     /// Emergency credit the meter may run into before it cuts off, and the smallest
     /// recharge the utility will accept — both READ FROM THE PORTAL, both nullable.
     /// Null means "the portal didn't tell us", and the UI then says nothing rather
-    /// than inventing a figure. (The old build shipped a hard-coded 99999 inside the
-    /// warning string — a placeholder shown to every user as if it were their meter's.)
+    /// than inventing a figure.
     /// </summary>
     public double? EmergencyBalance { get; set; }
     public double? MinRecharge { get; set; }
@@ -219,8 +215,7 @@ public class Snapshot
 
     /// <summary>
     /// Sanction load in kW as reported by the portal this sync; 0 when absent. Copied
-    /// onto <see cref="Meter.SanctionLoadKw"/> by Sync so the recharge suggestion keeps
-    /// working on syncs where the summary endpoint doesn't answer.
+    /// onto <see cref="Meter.SanctionLoadKw"/> by Sync.
     /// </summary>
     public double SanctionLoadKw { get; set; }
 
