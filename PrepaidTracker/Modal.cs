@@ -97,8 +97,6 @@ public static class Modal
             // The token is the one value here that has to leave the screen: it gets
             // typed into the meter keypad, twenty digits, standing at the wall. Mono
             // so the groups line up, and tap-to-copy so it need not be typed at all.
-            // Every row copies, because the account and meter numbers get retyped too
-            // and a row that copies silently is cheaper than a row with a button on it.
             var value = new Label
             {
                 Text = kv.Value, TextColor = Theme.Text, FontSize = 14,
@@ -136,8 +134,7 @@ public static class Modal
             list.Add(UI.Rule());
         }
 
-        // The rows scroll; the Close button does not. It goes to Present as a footer,
-        // pinned under the scroll region, so a long NESCO recharge can't push it off.
+        // The rows scroll; the Close button does not.
         stack.Add(list);
 
         var ok = UI.Primary(L.S("close"));
@@ -162,22 +159,15 @@ public static class Modal
         return tcs.Task;
     }
 
-    /// <summary>Returns the entered text, or null if dismissed.</summary>
     /// <summary>
     /// The manual reading, asked ONE way.
     ///
     /// There were two copies of this prompt and they had already drifted: Home asked for
     /// the balance AND anything recharged since the last reading, Usage asked only for the
-    /// balance and left Reading.Recharge at 0. That difference is not cosmetic. The derived
-    /// daily series computes a day's spend as
-    ///
-    ///     prevBalance + thisReading.Recharge − thisBalance
-    ///
-    /// so a reading entered from Usage after a ৳500 top-up produces a NEGATIVE spend,
-    /// Forecast hits its "topped up off-book; skip" guard, and every day in that interval
-    /// is silently dropped. On NESCO — where manual readings are the only source of a daily
-    /// series at all, and where people recharge every week or two — that quietly deleted
-    /// exactly the intervals that contained a recharge.
+    /// balance and left Reading.Recharge at 0. The derived daily series computes a day's
+    /// spend as prevBalance + thisReading.Recharge − thisBalance, so a reading entered
+    /// without the recharge after a top-up produced a NEGATIVE spend and every day in that
+    /// interval was silently dropped.
     ///
     /// Returns true when a reading was stored.
     /// </summary>
@@ -195,9 +185,13 @@ public static class Modal
         double.TryParse((recStr ?? "0").Replace(",", ""), System.Globalization.NumberStyles.Any,
             System.Globalization.CultureInfo.InvariantCulture, out var rec);
 
+        var now = DateTime.Now;
         Store.AddReading(meter.Id, new Reading
         {
-            Date = DateTime.Now.ToString("yyyy-MM-dd"),
+            Date = now.ToString("yyyy-MM-dd"),
+            // The person read the meter just now — record the moment, so a recharge made
+            // earlier today is correctly treated as already inside this balance.
+            ReadAt = now,
             Balance = bal,
             Recharge = Math.Max(0, rec)
         });
@@ -212,13 +206,10 @@ public static class Modal
     ///
     /// Every change writes as it happens; there is no "save". A meter that gets turned
     /// off immediately loses any reminder the OS was already holding for it (via
-    /// Notifier.CancelFor) — otherwise a user who flips the switch off is still ambushed
-    /// by tomorrow morning's already-armed 9am banner. Turning a meter back on doesn't
-    /// re-arm anything; the next sync will do that from a fresh forecast, which is safer
-    /// than arming from stale numbers.
+    /// Notifier.CancelFor). Turning a meter back on doesn't re-arm anything; the next
+    /// sync will do that from a fresh forecast.
     ///
-    /// When the master is off, per-account switches and editors are all dimmed —
-    /// interacting with them would be theatre while the whole channel is muted. Turning
+    /// When the master is off, per-account switches and editors are all dimmed. Turning
     /// the master ON asks the OS for notification permission and shows the "notifications
     /// are blocked" info modal if the OS refuses.
     /// </summary>
@@ -292,8 +283,7 @@ public static class Modal
 
             if (!e.Value)
             {
-                // Global off: clear every meter's queue. A subsequent language switch or
-                // threshold change would otherwise write into a stale queue.
+                // Global off: clear every meter's queue.
                 Notifier.CancelAllScheduled();
             }
             else
@@ -334,8 +324,6 @@ public static class Modal
 
         var sw = new Switch { IsToggled = m.NotificationsEnabled, OnColor = Theme.Green, ThumbColor = Colors.White };
 
-        // Summary label updates when the user edits — bind it via a factory closure so
-        // the editor callbacks below can call SetSummary() without hunting for the label.
         var summary = new Label
         {
             TextColor = Theme.Faint, FontSize = 12, VerticalOptions = LayoutOptions.Center
@@ -343,13 +331,7 @@ public static class Modal
         void RefreshSummary()
         {
             // Show the EFFECTIVE value (override if set, otherwise the app default) so the
-            // user sees the number that will actually fire, not the zero-means-inherit
-            // sentinel stored on disk.
-            // Use NBn (not N) so digits render as Bengali numerals in Bengali mode —
-            // this text reads as prose ("৳২০০ · ৩ দিন"), not as a copyable token like
-            // an account number, so mixed-script "৳ 200 · 3দ" looks half-translated.
-            // Full word "দিন" (not the one-letter "দ") reads as natural Bangla; add a
-            // space before it since it's a word, not a suffix.
+            // user sees the number that will actually fire. NBn, not N: this reads as prose.
             summary.Text = $"৳ {L.NBn(m.EffectiveLowTaka.ToString())} · " +
                            $"{L.NBn(m.EffectiveLowDays.ToString())}{(L.Bn ? " দিন" : "d")}";
         }
@@ -357,10 +339,6 @@ public static class Modal
 
         // ---- header row ----
         // Layout: [badge] [name / (account · summary)] [switch]
-        // The summary was previously in its own column next to the switch, which stole
-        // 60–80px from the name column and truncated "Md. Golam Warich" to "Md. Golam…".
-        // Moving it to the meta line (right-aligned, next to the account number) lets
-        // the name span the full remaining width.
         var header = new Grid
         {
             Padding = new Thickness(14, 12), ColumnSpacing = 10,
@@ -410,9 +388,7 @@ public static class Modal
             Spacing = 2, VerticalOptions = LayoutOptions.Center,
             Children =
             {
-                // Force single-line truncation. Without this, "Md. Golam Warich" wraps
-                // to two lines and — worse — iOS treats the "/" in "A/C" as a soft
-                // break, so the account number splits across lines as "A/" + "C 14024780".
+                // Force single-line truncation, so "A/C 14024780" can't split at the "/".
                 new Label
                 {
                     Text = name, TextColor = Theme.Text, FontSize = 14,
@@ -458,9 +434,7 @@ public static class Modal
         editor.Add(daysVal, 2, 1);
 
         // Persist a threshold edit, refresh the summary, and re-arm the queue with the
-        // new figure. Re-arming here is critical: the OS is still holding yesterday's
-        // reminder timed against the OLD threshold, and unless we cancel + re-schedule,
-        // the user won't feel their change take effect until the next background sync.
+        // new figure, so the user feels the change take effect immediately.
         async Task<bool> EditTaka()
         {
             var input = await Prompt(root, name, L.S("alertBelowTakaPrompt"),
@@ -502,9 +476,6 @@ public static class Modal
         daysVal.GestureRecognizers.Add(daysTap);
 
         // ---- expand/collapse on header tap ----
-        // The switch has its own hit area (MAUI's Switch swallows taps), so this tap
-        // fires only when the user hits the badge / name / summary — which is the
-        // interaction the affordance ("row expands") is meant to convey.
         var headerTap = new TapGestureRecognizer();
         headerTap.Tapped += (_, _) =>
         {
@@ -555,9 +526,6 @@ public static class Modal
         Notifier.CancelFor(m.Id);
         var snap = Store.Snapshot(m.Id);
         if (snap == null) return;
-        // Recompute from stored readings — same call the HomePage refresh uses, so the
-        // reminder we arm here matches the number the user is looking at. Not worth
-        // blocking the UI on a network hit; the next background sync will refresh anyway.
         var f = Forecast.Build(Store.Readings(m.Id), snap);
         Notifier.ScheduleLowBalance(m, f, snap.CustomerName);
     }
@@ -583,13 +551,26 @@ public static class Modal
         return g;
     }
 
+    /// <summary>
+    /// Returns the entered text, or null if dismissed.
+    ///
+    /// <paramref name="secret"/> masks the input and turns off spell-check and text
+    /// prediction — used for the DESCO password, which must not be shown on screen or
+    /// learned by the keyboard.
+    /// </summary>
     public static Task<string?> Prompt(Grid root, string title, string? message = null,
-        string? initial = null, string? placeholder = null, Keyboard? keyboard = null)
+        string? initial = null, string? placeholder = null, Keyboard? keyboard = null, bool secret = false)
     {
         var tcs = new TaskCompletionSource<string?>();
         var stack = Body(title, message);
 
         var entry = UI.Field(placeholder ?? "", initial, keyboard);
+        if (secret)
+        {
+            entry.IsPassword = true;
+            entry.IsSpellCheckEnabled = false;
+            entry.IsTextPredictionEnabled = false;
+        }
         var box = UI.Card(Theme.Card2, 12);
         box.Padding = new Thickness(14, 4);
         box.Content = entry;
@@ -742,14 +723,7 @@ public static class Modal
 
         // Android's ScrollView asks for every pixel of height it is offered, so a Border
         // wrapped round one grows to the whole screen and Center has nothing to centre.
-        // iOS shrink-wraps and is fine. So we do the measuring ourselves and pin the
-        // scroller to the answer.
-        //
-        // Note we MEASURE the stack rather than read its Height: MAUI's Android scroll
-        // view stretches its content to fill the viewport, so content.Height comes back
-        // as the full screen and every dialog ends up exactly `cap` tall — which is the
-        // bug this replaces. Measuring against an infinite height constraint asks the
-        // stack how tall it actually wants to be, which is the number we need.
+        // So we measure the stack ourselves and pin the scroller to the answer.
         void Fit()
         {
             var w = scroller.Width;
@@ -759,16 +733,14 @@ public static class Modal
             var want = Math.Min(natural, cap);
             if (want <= 0) return;
 
-            // Guarded: assigning HeightRequest relaunches layout, and an unguarded
-            // assignment here would chase its own tail.
+            // Guarded: assigning HeightRequest relaunches layout.
             if (Math.Abs(scroller.HeightRequest - want) > 0.5) scroller.HeightRequest = want;
         }
 
         scroller.SizeChanged += (_, _) => Fit();
         content.SizeChanged += (_, _) => Fit();
 
-        // A footer is pinned below the scroll region rather than dropped into it, so a
-        // long recharge can't push its own Close button out of reach.
+        // A footer is pinned below the scroll region rather than dropped into it.
         View inner = scroller;
         if (footer != null)
         {
@@ -819,18 +791,15 @@ public static class Modal
     {
         if (!root.Children.Contains(overlay)) return;
 
-        // A second tap during the 110ms fade would run a second Close (and, for Choose,
-        // pick a second account) on an overlay that's already on its way out.
+        // A second tap during the 110ms fade would run a second Close on an overlay
+        // that's already on its way out.
         overlay.InputTransparent = true;
 
         await overlay.FadeTo(0, 110, Easing.CubicIn);
         root.Remove(overlay);
 
-        // Hand the UI thread one clean frame before the caller resumes. Callers await
-        // Choose()/Prompt() and then immediately Refresh() — a full page rebuild, on
-        // this thread. Without the yield, Remove() and that rebuild land in the same
-        // turn, so iOS never paints the removal: the part-faded card just hangs there
-        // over the new content until the rebuild is done.
+        // Hand the UI thread one clean frame before the caller resumes, so iOS paints
+        // the removal before the caller's page rebuild lands on the same thread.
         await Task.Yield();
     }
 }
