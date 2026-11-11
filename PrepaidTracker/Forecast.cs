@@ -578,9 +578,9 @@ public class Forecast
     }
 
     /// <summary>
-    /// A live estimate of the balance "right now", between once-a-day meter reads.
-    /// Answers the question the big number can't when the portal is 12–36 hours behind
-    /// wall-clock: "roughly, what have I got at this moment?"
+    /// A live estimate of the balance "right now", between meter reads. Answers the
+    /// question the big number can't when the portal is hours behind wall-clock:
+    /// "roughly, what have I got at this moment?"
     ///
     ///     est = snap.Balance
     ///         − rate × (hours since reading / 24)
@@ -594,19 +594,16 @@ public class Forecast
     ///   • exactly 1 quiet → one-off outlier; use the plain EWMA.
     ///   • 0 quiet → normal life; blend 70% yesterday + 30% EWMA.
     ///
-    /// The SIGN carries real meaning and is never filtered out. The old rule "return null
-    /// when est &lt;= 0" hid the most important information exactly when the user most
-    /// needed it: someone on emergency credit at −৳50 burning another ৳25 would see only
-    /// the midnight −৳50, with no signal they were now at −৳75 and closer to cut-off.
+    /// The SIGN carries real meaning and is never filtered out: someone on emergency
+    /// credit at −৳50 burning another ৳25 must see that they are now at −৳75.
     ///
     /// Two things that must NEVER happen and don't: it never touches
     /// <see cref="Store.AddReading"/>, and it never drives
     /// <see cref="Notifier.CheckLowBalance"/>. Alerts fire off measurements.
     ///
     /// This matters MORE under DESCO's new portal, not less: live reads are rationed to
-    /// roughly one a day, so the measured balance is now stale by design for most of the
-    /// day and this chip is the only thing standing between the user and a number from
-    /// this morning.
+    /// one a day, so the measured balance is stale by design for most of the day and
+    /// this chip is the only thing standing between the user and an old number.
     /// </summary>
     public static double? LiveEstimate(Snapshot? snap, Forecast? f, string meterId = "")
     {
@@ -649,10 +646,7 @@ public class Forecast
         }
 
         // Recharges made after the read are not in the measured balance yet, so they
-        // are added back. Compared by MOMENT, not by date: NESCO reads at midnight, so
-        // "dated today or later" and "after the read" were the same thing, but DESCO's
-        // read is whenever the last live read happened (09:05, say), and a recharge at
-        // 08:00 the same day is already in that balance. See AfterRead.
+        // are added back. Compared by MOMENT, not by date — see AfterRead.
         //
         // Key-change sets are excluded: their amount is not a credit landing on the
         // meter, and adding it would make the chip hundreds of taka optimistic.
@@ -660,15 +654,9 @@ public class Forecast
             .Where(r => r.Success && !r.MultiToken && AfterRead(r, readAt))
             .Sum(r => r.EnergyAmount > 0 ? r.EnergyAmount : r.Amount);
 
-        // ...and the FAILED ones dated after the read, on trust. A portal "failed"
+        // ...and the FAILED ones made after the read, on trust. A portal "failed"
         // usually means the handshake timed out, not that the money stayed in the wallet.
-        // The estimate is the one number allowed to be optimistic — it is explicitly a
-        // projection, and the chip is marked provisional while it carries money we can't
-        // yet stand behind.
-        //
-        // Self-expiring, which is the whole safety argument: a recharge dated D sits in
-        // this window only until the read dated D+1 lands, at which point it falls BEHIND
-        // the read date and drops out whether it landed or not.
+        // Self-expiring: once a read is taken after the recharge, it drops out.
         if (meterId.Length > 0) pending += Reconcile.UnverifiedCredit(meterId, snap);
 
         LiveWhyNot = "shown";
@@ -682,8 +670,11 @@ public class Forecast
     /// True when a recharge happened after the meter read, so it is not yet in the
     /// measured balance. Uses the recharge's time when the portal gave one; otherwise
     /// falls back to "dated on or after the read's date", the original midnight rule.
+    ///
+    /// Internal because Sync.Record and Reconcile need the same rule: all three have to
+    /// agree about which side of a read a recharge falls on.
     /// </summary>
-    static bool AfterRead(RechargeRow r, DateTime readAt)
+    internal static bool AfterRead(RechargeRow r, DateTime readAt)
     {
         var readDate = readAt.ToString("yyyy-MM-dd");
 
@@ -694,6 +685,14 @@ public class Forecast
 
         return string.Compare(r.Date, readDate, StringComparison.Ordinal) >= 0;
     }
+
+    /// <summary>
+    /// True when the recharge happened after reading <paramref name="x"/> was taken, i.e.
+    /// it is NOT inside x's balance. By moment when the reading carries its read time;
+    /// by date for readings saved by older builds, which keeps their behaviour unchanged.
+    /// </summary>
+    internal static bool After(RechargeRow r, Reading x) =>
+        x.ReadAt is { } t ? AfterRead(r, t) : string.CompareOrdinal(r.Date, x.Date) >= 0;
 
     public static DateTime Date(string ymd) =>
         DateTime.ParseExact(ymd, "yyyy-MM-dd", CultureInfo.InvariantCulture);
