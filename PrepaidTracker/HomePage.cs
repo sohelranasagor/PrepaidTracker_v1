@@ -144,6 +144,32 @@ public class HomePage : AppPage
         }
     }
 
+    /// <summary>
+    /// Called from App.OnResume — the app coming back from the background, possibly the
+    /// next day. A resume never calls OnAppearing, so without this the page kept showing
+    /// yesterday's balance, yesterday's "N h ago", and a ↻ still faded from yesterday's
+    /// limit until the user happened to pull down.
+    ///
+    /// Repaints first, so the freshness text, the live estimate and the ↻ state are
+    /// current the instant the app is visible. Then a silent CACHED sync — free, never
+    /// spends DESCO's live read — skipped if the last sync was under 15 minutes ago, so
+    /// flicking between apps doesn't hit DESCO every time. If the session expired while
+    /// the app was in the background, that sync signs in again with the saved password
+    /// on the way, with no prompt.
+    /// </summary>
+    public async Task ResumeAsync()
+    {
+        Refresh();
+
+        var meter = Store.Selected();
+        if (meter == null) return;
+
+        var snap = Store.Snapshot(meter.Id);
+        if (snap != null && DateTime.Now - snap.SyncedAt < TimeSpan.FromMinutes(15)) return;
+
+        await Sync(silent: true);
+    }
+
     void Refresh()
     {
         Invalidate();
@@ -164,7 +190,7 @@ public class HomePage : AppPage
     /// </summary>
     bool _freshQueued;
 
-    /// <param name="silent">No error modal — used by the on-appear auto-sync.</param>
+    /// <param name="silent">No error modal — used by the on-appear and on-resume auto-syncs.</param>
     /// <param name="userRequestedFresh">
     /// True only when the person tapped refresh or pulled down. DESCO allows one fresh
     /// meter read per meter per day; every other path reads their cached figure, which
@@ -172,11 +198,11 @@ public class HomePage : AppPage
     /// </param>
     public async Task Sync(bool silent = false, bool userRequestedFresh = false)
     {
-        // Pull-to-refresh, the ↻ button, and the on-appear auto-sync can all land at
-        // once; two fetches in flight interleave status updates and double-record the
-        // day's reading. A cached request arriving mid-sync is redundant and can be
-        // dropped; a FRESH one is the user asking for something the running sync won't
-        // do, so it is queued.
+        // Pull-to-refresh, the ↻ button, and the automatic syncs can all land at once;
+        // two fetches in flight interleave status updates and double-record the day's
+        // reading. A cached request arriving mid-sync is redundant and can be dropped; a
+        // FRESH one is the user asking for something the running sync won't do, so it
+        // is queued.
         if (_syncing)
         {
             _freshQueued |= userRequestedFresh;
@@ -198,10 +224,8 @@ public class HomePage : AppPage
         if (meter == null) return;
 
         // A DESCO meter with no stored sign-in can't fetch anything. Ask here rather
-        // than letting the fetch fail with an auth error: the user added this account
-        // deliberately, and the next thing they need is the password prompt, not a
-        // message about a session they never had. Silent (auto) syncs never prompt —
-        // a modal appearing on its own when the app opens is startling.
+        // than letting the fetch fail with an auth error. Silent (auto) syncs never
+        // prompt — a modal appearing on its own when the app opens is startling.
         if (meter.Utility == Utility.Desco && !DescoApi.HasCredential(meter.Account))
         {
             if (silent) { _status = L.S("authNeeded"); Refresh(); return; }
@@ -239,9 +263,7 @@ public class HomePage : AppPage
         }
 
         // The session died and the stored password no longer works. Offer the prompt
-        // immediately: this is the one failure a user can fix in ten seconds, and
-        // burying it behind a generic error means the balance quietly ages while the
-        // app looks like it's working.
+        // immediately: this is the one failure a user can fix in ten seconds.
         if (provider is DescoProvider auth && auth.LastState == SessionState.NeedsLogin)
         {
             _status = L.S("authExpiredBody");
@@ -263,10 +285,8 @@ public class HomePage : AppPage
             return;
         }
 
-        // The portal reports the connection's sanction load, and the demand charge it
-        // predicts is worth real money in the recharge suggestion. Cache it so a sync
-        // where the summary endpoint didn't answer doesn't drop the suggestion back to
-        // its fallback path. Written only on change — meters.json is rewritten whole.
+        // Cache the sanction load so a sync where the summary endpoint didn't answer
+        // doesn't drop the suggestion back to its fallback path. Written only on change.
         if (result.Snapshot.SanctionLoadKw > 0
             && Math.Abs(meter.SanctionLoadKw - result.Snapshot.SanctionLoadKw) > 0.01)
         {
@@ -274,27 +294,21 @@ public class HomePage : AppPage
             Store.SaveMeter(meter);
         }
 
-        // One shared recorder now (Sync.cs). There used to be two — this one and a copy
-        // inside BackgroundSync — and they had drifted: the background copy counted FAILED
-        // recharges as credit, inflating the day's spend, the rate, and days-left.
-        //
-        // Fully qualified on purpose: this class has its own Sync(bool) method, so a bare
-        // `Sync.Record` binds to the method and the compiler rejects it (CS0119).
+        // One shared recorder (Sync.cs). Fully qualified on purpose: this class has its
+        // own Sync(bool) method, so a bare `Sync.Record` binds to the method and the
+        // compiler rejects it (CS0119).
         PrepaidTracker.Sync.Record(meter, result.Snapshot);
         _status = "";
         Refresh();
 
         var f = Forecast.Build(Store.Readings(meter.Id), result.Snapshot);
-        // Schedule BEFORE checking — see the note in Sync.RunAllAsync. The queued set has
-        // to exist before the live alert decides whether it would be a duplicate.
+        // Schedule BEFORE checking — see the note in Sync.RunAllAsync.
         Notifier.ScheduleLowBalance(meter, f, result.Snapshot?.CustomerName);   // low later: queued with the OS
         Notifier.CheckLowBalance(meter, f, result.Snapshot?.CustomerName);      // low right now
 
         // Settle any failed recharge this read has overtaken. A verdict that flips to
         // Credited means the reading we just banked was computed without that money, so
-        // bank it again — AddReading replaces by date, so this is a correction, not a
-        // duplicate. Home used to skip this entirely, so verdicts only ever settled on a
-        // background sync, which on iOS might be days away.
+        // bank it again — AddReading replaces by date, so this is a correction.
         if (Reconcile.Run(meter, result.Snapshot!, f?.DailyAvg ?? 0))
         {
             PrepaidTracker.Sync.Record(meter, result.Snapshot!);
@@ -307,10 +321,7 @@ public class HomePage : AppPage
             _ = ShowQuotaPopup(meter, result.Snapshot);
 
         // The user asked for a fresh read and it did NOT produce a new balance for any
-        // other reason — DESCO answered with an error, timed out, or the meter didn't
-        // respond. Every one of these used to be silent: the cached figure stayed on
-        // screen looking exactly like a successful refresh. Say what happened, with
-        // DESCO's own status, so "why didn't it update?" has an answer.
+        // other reason. Say what happened, with DESCO's own status.
         if (!silent && provider is DescoProvider fr && fr.FreshFailure is { } why)
             _ = Modal.Info(Root, L.S("quotaTitle"), L.S("freshFailed", why));
     }
@@ -320,8 +331,7 @@ public class HomePage : AppPage
     void Render()
     {
         // On iOS, Layout.Children.Clear() inside a RefreshView can leave the old
-        // native subviews behind (the launch bug: onboarding visible stacked under
-        // the home content). Replacing the ScrollView's content tears the native
+        // native subviews behind. Replacing the ScrollView's content tears the native
         // tree down for real, so do that whenever the page changes mode.
         var mode = Store.Meters().Count == 0 ? Mode.Onboarding : Mode.Home;
         if (mode != _mode)
@@ -340,9 +350,7 @@ public class HomePage : AppPage
         var snap = Store.Snapshot(meter.Id);
         var f = Forecast.Build(Store.Readings(meter.Id), snap);
 
-        // The meter's EFFECTIVE thresholds — its own override if set, otherwise the app
-        // default — the same figures Notifier alerts on. Using the app-wide values here
-        // made the banner and the notification disagree for any customised meter.
+        // The meter's EFFECTIVE thresholds — the same figures Notifier alerts on.
         bool low = snap is not { BalanceReported: false }
                    && ((f?.DaysLeft is { } d && d < meter.EffectiveLowDays)
                        || (f != null && f.Balance < meter.EffectiveLowTaka));
@@ -414,11 +422,8 @@ public class HomePage : AppPage
             _body.Add(UI.Hint(f is { FromMonthly: true }
                 ? L.S(meter.Utility == Utility.Nesco ? "monthlyNote" : "monthlyNoteFallback")
                 : meter.Utility == Utility.Nesco ? L.S("noDaily") : L.S("needMoreData")));
-            // "+ Add reading" is a NESCO-only lever: NESCO publishes no daily feed,
-            // so manual readings are the ONLY way to build a daily series. On DESCO
-            // the rate comes from the utility's own figures, and surfacing an "add
-            // reading" action there makes an API-fed account read as if the user has
-            // to do the portal's job. Store.AddReading stays callable from Profile.
+            // "+ Add reading" is a NESCO-only lever: NESCO publishes no daily feed, so
+            // manual readings are the ONLY way to build a daily series there.
             if (meter.Utility == Utility.Nesco)
             {
                 var add = UI.Ghost("＋ " + L.S("addReading"));
@@ -444,9 +449,6 @@ public class HomePage : AppPage
                          .ThenByDescending(x => x.Time, StringComparer.Ordinal)
                          .Take(3))
             {
-                // Home's rows were inert: RechargeRowView only attaches a gesture when it is
-                // given one, and Home never passed it. Same modal as Usage — a person who taps
-                // a recharge on the first screen they see means the same thing there.
                 var row = r;   // capture per-iteration for the tap closure
                 rs.Add(RechargeRowView(row, showStatus: !row.Success || row.MultiToken,
                     state: Reconcile.StateOf(meter.Id, row),
@@ -499,9 +501,8 @@ public class HomePage : AppPage
                 new Point(0, 0), new Point(0.9, 1)),
             Stroke = Colors.Transparent,
             StrokeShape = new RoundRectangle { CornerRadius = new CornerRadius(0, 0, 30, 30) },
-            // Bottom edge lands ~30pt below the balance card's top — just under
-            // its label row, exactly where it was marked in review. Tracks the
-            // same padding expression as the content so the two never drift.
+            // Bottom edge lands ~30pt below the balance card's top, tracking the same
+            // padding expression as the content so the two never drift.
             HeightRequest = 96 + Math.Max(StatusBarPad - 36, 12),
             VerticalOptions = LayoutOptions.Start,
             Content = decor   // clipped to the rounded band
@@ -536,9 +537,8 @@ public class HomePage : AppPage
         var content = new VerticalStackLayout
         {
             Spacing = 12,
-            // Measured from a marked device screenshot: ~38pt of dead green sat
-            // between the status bar and the greeting. Subtract exactly that,
-            // with a floor so no device can push the greeting into the clock.
+            // ~38pt of dead green sat between the status bar and the greeting. Subtract
+            // exactly that, with a floor so no device can push the greeting into the clock.
             Padding = new Thickness(16, Math.Max(StatusBarPad - 36, 12), 16, 14),
             Children = { greeting, BalanceCard(meter, snap, f, low) }
         };
@@ -584,11 +584,10 @@ public class HomePage : AppPage
 
     /// <summary>
     /// The daily-average TripleStat cell, adaptive. When the all-days mean and the
-    /// active-day mean agree to the taka (a week with no zero-consumption days), the
-    /// cell shows one number and looks exactly like the pre-split design. When they
-    /// disagree (any quiet day in the window), it stacks both under one shared label,
-    /// with the active-day figure highlighted green — that's the number the days-left
-    /// pill, bill estimate, and suggested-recharge all use.
+    /// active-day mean agree to the taka, the cell shows one number. When they
+    /// disagree, it stacks both under one shared label, with the active-day figure
+    /// highlighted green — that's the number the days-left pill, bill estimate, and
+    /// suggested-recharge all use.
     /// </summary>
     static View DailyAvgCell(Forecast? f) =>
         AverageCellCore(L.S("dailyAvg"),
@@ -604,10 +603,6 @@ public class HomePage : AppPage
     /// <summary>
     /// Shared: split into "all days / active days" if the two rounded figures differ
     /// AND the meter has at least one active day. Otherwise a single-value cell.
-    ///
-    /// The rounded-taka comparison is deliberate — a tiny EWMA-vs-flat-mean difference
-    /// (৳57.8 vs ৳58.1) would show identical numbers on screen, and the split cell
-    /// would look like the same number twice with two different labels.
     /// </summary>
     static View AverageCellCore(string label, double? active, double? allDays, string singleFallback)
     {
@@ -625,7 +620,6 @@ public class HomePage : AppPage
     Border BalanceCard(Meter meter, Snapshot? snap, Forecast? f, bool low)
     {
         var card = UI.Card(Color.FromArgb("#18231E"), 24);
-        // Compact per review: the card measured ~400pt tall on device.
         card.Padding = new Thickness(18, 14);
         card.Stroke = Color.FromArgb("#2C4A3C");   // green-tinted edge lifts it off the band
         card.Shadow = new Shadow { Brush = new SolidColorBrush(Colors.Black), Opacity = 0.35f, Radius = 18, Offset = new Point(0, 8) };
@@ -648,8 +642,7 @@ public class HomePage : AppPage
         hs.Add(head);
 
         // A DESCO meter that has never been signed in can show nothing at all. Say so
-        // with an action rather than an empty card: the account is configured, the app
-        // just needs a password it was never given.
+        // with an action rather than an empty card.
         if (meter.Utility == Utility.Desco && !DescoApi.HasCredential(meter.Account))
         {
             hs.Add(new Label { Text = "৳ —", TextColor = Theme.Text, FontSize = 36, FontAttributes = FontAttributes.Bold });
@@ -676,10 +669,8 @@ public class HomePage : AppPage
         }
         else
         {
-            // The estimate may be carrying a failed recharge on trust (see
-            // Reconcile.UnverifiedCredit). When it is, the chip says so — and the caption
-            // names the figure, because "this number might be wrong" is not useful
-            // without "by roughly this much".
+            // The estimate may be carrying a failed recharge on trust. When it is, the
+            // chip says so — and the caption names the figure.
             var unverified = Reconcile.UnverifiedCredit(meter.Id, snap);
 
             hs.Add(BalanceLine(f?.Balance ?? 0, Theme.Text,
@@ -700,8 +691,7 @@ public class HomePage : AppPage
         var pillRow = new Grid { ColumnDefinitions = { new ColumnDefinition(GridLength.Auto), new ColumnDefinition(GridLength.Star) } };
         if (f?.DaysLeft != null && snap is not { BalanceReported: false })
         {
-            // A meter already in the red has no "days left" to report — saying
-            // "0 days left" (and previously "-1 days left") is just noise.
+            // A meter already in the red has no "days left" to report.
             var overdrawn = f.Balance < 0;
             var days = $"{f.DaysLeft:0}";
             var pillText = overdrawn ? "⚠︎ " + L.S("rechargeNow")
@@ -723,9 +713,6 @@ public class HomePage : AppPage
         hs.Add(pillRow);
 
         // WHEN the meter was actually read, and how many distinct updates we've seen.
-        // Our sync time says nothing; the portal's balance only moves when the meter
-        // reports. Now doubly true on DESCO, where live reads are rationed — the figure
-        // on screen is their cached one for most of the day by design.
         if (snap?.ReadingTime is { } readAt)
         {
             var count = Store.MeterUpdateCount(meter.Id);
@@ -743,8 +730,7 @@ public class HomePage : AppPage
 
         if (_status.Length > 0)
         {
-            // First line in colour; any probe log after it in a quiet mono block,
-            // so a failed sync reads as information rather than a wall of red.
+            // First line in colour; any probe log after it in a quiet mono block.
             var nl = _status.IndexOf('\n');
             var headline = nl < 0 ? _status : _status[..nl].Trim();
             var rest = nl < 0 ? "" : _status[nl..].Trim();
@@ -784,10 +770,8 @@ public class HomePage : AppPage
             hs.Add(warn);
         }
 
-        // A failed recharge the meter has now DISPROVED. This is the only place the app
-        // asks the user to go and do something with a keypad, so it earns its own banner
-        // — and it carries the token itself, because "enter the token manually" without
-        // the digits is advice nobody can act on.
+        // A failed recharge the meter has now DISPROVED gets its own banner, carrying the
+        // token itself.
         var unapplied = Reconcile.NeedsToken(meter.Id, snap);
         if (unapplied.Count > 0) hs.Add(TokenBanner(meter, unapplied[0]));
 
@@ -809,6 +793,11 @@ public class HomePage : AppPage
     /// Small ↻ in the balance card, for people who never discover pull-to-refresh.
     /// When DESCO says today's read is used up, the button goes quiet and a tap shows
     /// the same limit message the portal shows, instead of doing nothing.
+    ///
+    /// The LOOK is decided when the button is drawn; the ACTION is decided when it is
+    /// tapped. The two used to share one value captured at draw time, so a button drawn
+    /// before midnight and tapped after it still showed yesterday's limit message
+    /// instead of doing the live read the user was now entitled to.
     /// </summary>
     View SyncButton(Meter meter, Snapshot? snap)
     {
@@ -835,9 +824,12 @@ public class HomePage : AppPage
         var tap = new TapGestureRecognizer();
         tap.Tapped += async (_, _) =>
         {
-            if (blocked)
+            // Checked NOW, against the stored snapshot, not the value captured when the
+            // button was drawn: it may have been drawn before midnight and tapped after.
+            var current = Store.Snapshot(meter.Id);
+            if (current?.NextEligible is { } until && DateTime.Now < until)
             {
-                await ShowQuotaPopup(meter, snap);
+                await ShowQuotaPopup(meter, current);
                 return;
             }
             Invalidate();
@@ -852,8 +844,7 @@ public class HomePage : AppPage
     ///
     /// The catch: SyncButton() calls this the moment the icon is CONSTRUCTED, which is
     /// before it is attached to the visual tree. At that point IsLoaded is false and
-    /// RotateTo() is a no-op — so gating the loop on IsLoaded meant the loop never ran a
-    /// single turn. Wait for the Loaded event instead, then spin.
+    /// RotateTo() is a no-op — so wait for the Loaded event instead, then spin.
     /// </summary>
     void Spin(View icon)
     {
@@ -878,10 +869,8 @@ public class HomePage : AppPage
         {
             while (_syncing && icon.Parent != null)
             {
-                // NEGATIVE, i.e. anti-clockwise. MAUI's positive Rotation is clockwise,
-                // but the Tabler refresh glyph's two arrows both sweep anti-clockwise,
-                // so turning it +360 dragged the arrowheads backwards against the
-                // direction they point.
+                // NEGATIVE, i.e. anti-clockwise: the Tabler refresh glyph's two arrows
+                // both sweep anti-clockwise.
                 await icon.RotateTo(-360, 900, Easing.Linear);
                 icon.Rotation = 0;                    // -360° == 0°, so this is invisible
             }
@@ -912,9 +901,8 @@ public class HomePage : AppPage
         var utility = Utility.Desco;
         var error = new Label { Text = "", TextColor = Theme.Red, FontSize = 12, IsVisible = false };
 
-        // The hero goes in the SCROLLING body, not the pinned header. Pinned, it ate
-        // ~40% of the screen; the iOS number pad (which has no Done key) then covered
-        // the Continue button with no way to scroll it into view.
+        // The hero goes in the SCROLLING body, not the pinned header, so the iOS number
+        // pad can never cover the Continue button with no way to scroll it into view.
         var hero = new Border
         {
             Background = new LinearGradientBrush(
@@ -944,9 +932,8 @@ public class HomePage : AppPage
 
         _body.Add(UI.Eyebrow(L.S("chooseUtility")));
 
-        // DESCO now needs a portal account as well as a meter number, and a first-run
-        // user has no way to know that. The note appears only on the DESCO side, so a
-        // NESCO user isn't warned about a step they'll never take.
+        // DESCO now needs a portal account as well as a meter number. The note appears
+        // only on the DESCO side, so a NESCO user isn't warned about a step they'll never take.
         var descoNote = new Label
         {
             Text = L.S("authRegisterFirst"),
@@ -1004,8 +991,6 @@ public class HomePage : AppPage
 
             // DESCO: collect the portal sign-in before the first fetch, so the very
             // first thing a new user sees is a balance rather than an auth error.
-            // Sync() would prompt anyway, but prompting here keeps the onboarding flow
-            // in one continuous sequence.
             if (utility == Utility.Desco)
             {
                 var added = Store.Meters().FirstOrDefault(m => m.Account == acct && m.Utility == utility);
@@ -1042,16 +1027,13 @@ public class HomePage : AppPage
 
     /// <summary>
     /// The amber banner's text: the situation first, then whatever hard numbers the
-    /// utility actually gave us for this meter. Every clause is conditional — a figure
-    /// the portal didn't publish simply doesn't appear.
+    /// utility actually gave us for this meter. A figure the portal didn't publish
+    /// simply doesn't appear.
     /// </summary>
     static string WarningText(Snapshot? snap, Forecast? f)
     {
         var parts = new List<string> { L.S(f is { Balance: < 0 } ? "negWarning" : "lowWarning") };
 
-        // ONLY what the portal published. There used to be a fallback to a figure the
-        // user typed into Profile, but that setting is gone. If the utility didn't
-        // publish it, the clause is omitted — an unknown number is not worth guessing at.
         if (snap?.EmergencyBalance is { } ec)
             parts.Add(L.S("emergencyCredit", L.N($"{ec:#,0.##}")));
         if (snap?.MinRecharge is { } min)
@@ -1062,13 +1044,8 @@ public class HomePage : AppPage
 
     /// <summary>
     /// The big balance number, with an optional live-estimate chip riding to its
-    /// right. The chip sits vertically centred on the big number so the eye reads
-    /// them as a pair — measurement + projection — rather than as separate rows.
-    ///
-    /// A negative balance means the meter is running on emergency credit — the one
-    /// number in this app that is genuinely bad news — so it overrides whatever
-    /// colour the caller asked for and goes red. The minus sits ahead of the ৳ so it
-    /// reads as "minus 86.67 taka", not as a stray dash after the currency mark.
+    /// right. A negative balance means the meter is running on emergency credit, so
+    /// it overrides the caller's colour and goes red.
     /// </summary>
     static View BalanceLine(double amount, Color color, double? estimate = null, bool provisional = false)
     {
@@ -1090,17 +1067,8 @@ public class HomePage : AppPage
         };
 
         // Colour the chip by what it tells the user relative to the big number:
-        //   • measured POS, estimate POS → muted grey; both agree in spirit.
-        //   • measured POS, estimate NEG → RED; the day's consumption has already
-        //     pushed you into emergency credit even though the midnight snapshot
-        //     still shows positive.
-        //   • measured NEG, estimate POS → GREEN; a recharge landed AFTER the last
-        //     read, so the red big number is stale bad news.
-        //   • measured NEG, estimate NEG → RED; still on emergency credit, and the
-        //     current debt is DEEPER than the midnight number shows.
-        //
-        // Sign detection happens AFTER rounding — otherwise a projection of −0.4 would
-        // show as "≈ -৳0" in red, a sign and colour attached to a displayed zero.
+        // red when the estimate is negative, green when a recharge has lifted a negative
+        // measured balance, muted otherwise. Sign is decided AFTER rounding.
         if (estimate is { } est)
         {
             var estRounded = Math.Round(est);
@@ -1110,10 +1078,8 @@ public class HomePage : AppPage
                            : negative ? Theme.Green
                            : Theme.Muted;
 
-            // An estimate carrying an unverified recharge is a different KIND of number
-            // from one built on measured figures alone. The ordinary projection drifts by
-            // a fraction of a day's burn; this one can be several hundred taka wrong in a
-            // single step. Red still wins — a negative estimate is the more urgent fact.
+            // An estimate carrying an unverified recharge is a different KIND of number.
+            // Red still wins — a negative estimate is the more urgent fact.
             if (provisional && !estNegative) chipColor = Theme.Amber;
 
             var absText = $"{Math.Abs(estRounded):#,0}";
@@ -1149,9 +1115,7 @@ public class HomePage : AppPage
 
     /// <summary>
     /// The manual-token prompt, raised when Reconcile has watched a meter read go by
-    /// without the balance moving. Tapping it opens the same detail modal as the recharge
-    /// row: the token is the one field most people need, but the rest of the transaction
-    /// is what they'll want if they end up having to call the utility.
+    /// without the balance moving. Tapping it opens the same detail modal as the recharge row.
     /// </summary>
     View TokenBanner(Meter meter, RechargeRow r)
     {
@@ -1171,10 +1135,8 @@ public class HomePage : AppPage
             FontSize = 11
         });
 
-        // AllTokens, not TokenOf. A meter key-change carries a SET — twelve in the
-        // captured data — and every one has to be keyed, in order. Showing the first
-        // and dropping eleven is worse than showing none, because the user would think
-        // they were done.
+        // AllTokens, not TokenOf. A meter key-change carries a SET, and every one has to
+        // be keyed, in order.
         var tokens = Reconcile.AllTokens(r);
         if (tokens.Count > 0)
         {
@@ -1194,9 +1156,7 @@ public class HomePage : AppPage
             {
                 list.Add(new Label
                 {
-                    // Menlo, grouped in fours. Twenty unbroken digits in a proportional
-                    // font is not keyable, and losing your place means starting again.
-                    // Numbered when there's more than one, so the user can keep count.
+                    // Menlo, grouped in fours, numbered when there's more than one.
                     Text = (tokens.Count > 1 ? $"{i + 1}.  " : "") + tokens[i],
                     TextColor = Theme.Amber,
                     FontSize = 13,
@@ -1217,9 +1177,7 @@ public class HomePage : AppPage
             });
         }
 
-        // Dismissal is the user's call, not ours. The verdict itself is never revisited,
-        // but whether the prompt still needs to be on screen is something only they know:
-        // the app cannot see a keypad.
+        // Dismissal is the user's call: the app cannot see a keypad.
         var done = UI.Ghost(L.S("tokenEntered"));
         done.HeightRequest = 36;
         done.FontSize = 12;
@@ -1246,9 +1204,7 @@ public class HomePage : AppPage
     {
         var chip = UI.Card(Theme.Card, 16);
         chip.Padding = new Thickness(12, 6);
-        // The chevron used to be the character "⌄" inside the label text. A glyph sits
-        // on the TEXT BASELINE, not on the row's centre line, so it always rode low.
-        // Draw it instead, and centre it against the number.
+        // The chevron is drawn, not typed: a glyph sits on the text baseline and rode low.
         chip.Content = new HorizontalStackLayout
         {
             Spacing = 6,
@@ -1280,8 +1236,7 @@ public class HomePage : AppPage
             _syncedThisLaunch = "";
 
             // Sync() opens by setting _status = "syncing" and calling Refresh(), which
-            // repaints the whole page for the new account anyway. Calling Refresh() here
-            // too rebuilt the entire tree twice in the same UI-thread turn.
+            // repaints the whole page for the new account anyway.
             if (_syncing) Refresh();
             await Sync(silent: true);
         };
@@ -1291,8 +1246,7 @@ public class HomePage : AppPage
 
     static View ActionTile(View icon, string label, Action onTap)
     {
-        // Circular icon buttons with the label beneath — the flat rectangular
-        // tiles read as placeholders; circles read as actions.
+        // Circular icon buttons with the label beneath — circles read as actions.
         var circle = new Border
         {
             WidthRequest = 58,
@@ -1328,8 +1282,7 @@ public class HomePage : AppPage
         return stack;
     }
 
-    // ---- drawn icons, all in the mockup's Tabler-outline style: thin stroke,
-    //      round joins, no heavy fills ----
+    // ---- drawn icons, all in the Tabler-outline style: thin stroke, round joins ----
 
     /// <summary>Tabler "credit-card": outlined card with the stripe line.</summary>
     public static View CardIcon() => StrokeIcon(
@@ -1377,9 +1330,6 @@ public class HomePage : AppPage
     /// <summary>SVG path → filled MAUI shape, centred in its slot.</summary>
     static View VectorIcon(string pathData, Color color, double size) => new Path
     {
-        // The converter's signature is object?, but it only returns null for
-        // unparseable input — and ours are compile-time constants. The bang
-        // silences CS8600 without changing behaviour.
         Data = (Geometry)new PathGeometryConverter().ConvertFromInvariantString(pathData)!,
         Fill = new SolidColorBrush(color),
         Aspect = Stretch.Uniform,
@@ -1434,25 +1384,17 @@ public class HomePage : AppPage
             ColumnSpacing = 12,
             ColumnDefinitions = { new ColumnDefinition(new GridLength(36)), new ColumnDefinition(GridLength.Star), new ColumnDefinition(GridLength.Auto) }
         };
-        // A key-change set is neither a success nor a failure — it's a different kind of
-        // transaction, so it gets its own mark rather than borrowing one that implies a
-        // verdict we deliberately don't make.
+        // A key-change set is neither a success nor a failure, so it gets its own mark.
         var glyph = r.MultiToken ? "⚿" : r.Success ? "⊕" : "✕";
         var glyphColor = r.MultiToken ? Theme.Muted : r.Success ? Theme.Green : Theme.Red;
         g.Add(new Label { Text = glyph, TextColor = glyphColor, FontSize = 17, VerticalOptions = LayoutOptions.Center, HorizontalTextAlignment = TextAlignment.Center }, 0, 0);
 
         var mid = new VerticalStackLayout { Spacing = 2 };
-        // Payable (gross) amount, with the electricity actually credited INLINE
-        // after it: "৳ 500.00 · ⚡ ৳ 354.36". Spans keep the numbers in Menlo
-        // while the ⚡ and separators use the system font (Menlo has no Bangla
-        // or emoji glyphs).
+        // Payable (gross) amount, with the electricity actually credited INLINE after it.
         var amount = new FormattedString();
         amount.Spans.Add(new Span { Text = "৳ ", TextColor = Theme.Text, FontSize = 15, FontAttributes = FontAttributes.Bold });
         amount.Spans.Add(new Span { Text = $"{r.Amount:#,0.00}", TextColor = Theme.Text, FontSize = 15, FontAttributes = FontAttributes.Bold, FontFamily = "Menlo" });
-        // Show the electricity-credited chip whenever the utility reported one — DESCO
-        // reports a would-have-been energyAmount on failed rows too, which is genuinely
-        // useful, but must not READ as "money that reached the meter". Colour carries
-        // the outcome: green for money that arrived, muted grey for money that didn't.
+        // Colour carries the outcome: green for money that arrived, grey for money that didn't.
         if (r.EnergyAmount > 0 && Math.Abs(r.EnergyAmount - r.Amount) > 0.005)
         {
             var chipColor = r.Success && !r.MultiToken ? Theme.Green : Theme.Muted;
@@ -1471,10 +1413,8 @@ public class HomePage : AppPage
 
         if (showStatus)
         {
-            // "Failed" is the PORTAL's word, and on its own it misleads in both
-            // directions: it covers money that arrived perfectly well, and it covers a
-            // token still sitting unused in the transaction details. Report what WE know
-            // instead — and say "verifying" for as long as that is the truthful answer.
+            // "Failed" is the PORTAL's word. Report what WE know instead — and say
+            // "verifying" for as long as that is the truthful answer.
             var st = state ?? (r.MultiToken ? CreditState.Informational
                              : r.Success ? CreditState.Credited : CreditState.Unverified);
 
@@ -1502,21 +1442,15 @@ public class HomePage : AppPage
     }
 
     /// <summary>
-    /// Rows for the detail modal: the summary fields first, then everything
-    /// the utility reported verbatim. Values are tidied here too, because
-    /// snapshots cached by older builds may contain leaked HTML-attribute
-    /// junk (class='…' data-token='…') from before the parser fix.
+    /// Rows for the detail modal: the summary fields first, then everything the
+    /// utility reported verbatim, tidied of HTML-attribute junk from old caches.
     /// </summary>
     public static IEnumerable<KeyValuePair<string, string>> DetailRows(RechargeRow r)
     {
         yield return new(L.S("recharge"), "৳ " + $"{r.Amount:#,0.00}");
-        // The electricity value the utility calculated — shown on failed rows too,
-        // because the Status field below already tells the reader whether it landed.
         if (r.EnergyAmount > 0)
             yield return new(L.S("electricity"), "৳ " + $"{r.EnergyAmount:#,0.00}");
-        // The demand charge is a real deduction levied on the first recharge of a
-        // month. Itemising it is what makes "I paid ৳400 and got ৳214 of power" stop
-        // looking like a mistake.
+        // The demand charge is a real deduction levied on the first recharge of a month.
         if (r.DemandCharge > 0)
             yield return new(L.Bn ? "ডিমান্ড চার্জ" : "Demand charge", "৳ " + $"{r.DemandCharge:#,0.00}");
         yield return new(L.Bn ? "তারিখ" : "Date",
@@ -1524,8 +1458,7 @@ public class HomePage : AppPage
         if (r.Via.Length > 0) yield return new(L.Bn ? "মাধ্যম" : "Via", r.Via);
         yield return new(L.Bn ? "অবস্থা" : "Status", r.Success ? L.S("success") : L.S("failed"));
 
-        // Every token, grouped and numbered. A key-change set carries a dozen; the
-        // Details dictionary below would show them as one unreadable comma-run.
+        // Every token, grouped and numbered.
         var tokens = Reconcile.AllTokens(r);
         if (tokens.Count == 1)
             yield return new(L.Bn ? "টোকেন" : "Token", tokens[0]);
@@ -1535,8 +1468,7 @@ public class HomePage : AppPage
 
         foreach (var kv in r.Details)
         {
-            // The raw token field is already rendered above, grouped. Skipping it here
-            // avoids showing the same digits twice, once unreadably.
+            // The raw token field is already rendered above, grouped.
             if (kv.Key.IndexOf("token", StringComparison.OrdinalIgnoreCase) >= 0 || kv.Key.Contains("টোকেন"))
                 continue;
             var v = System.Text.RegularExpressions.Regex.Replace(kv.Value, @"\s+", " ").Trim();
@@ -1548,13 +1480,9 @@ public class HomePage : AppPage
 
     /// <summary>
     /// The recharge token is the one value here a person actually retypes — into the
-    /// meter keypad, 20 digits, standing at the wall. DESCO's own receipt prints it
-    /// 1246-1502-1501-0810-5738; the API returns it as one unbroken run. Only touch a
-    /// value that is all digits and long enough to be a token — a Seq No of "16" or an
-    /// Order ID must pass through untouched.
-    ///
-    /// Still used for NESCO, whose detail keys may carry a token the Tokens array
-    /// doesn't (its HTML table is scraped, not parsed from JSON).
+    /// meter keypad, 20 digits. Only touch a value that is all digits and long enough
+    /// to be a token. Still used for NESCO, whose detail keys may carry a token the
+    /// Tokens array doesn't.
     /// </summary>
     static string Token(string key, string value)
     {
@@ -1567,8 +1495,7 @@ public class HomePage : AppPage
         return string.Join("-", groups);
     }
 
-    // One implementation, in Modal.AskReading — see the note there on why these two
-    // copies of the prompt could not be allowed to differ.
+    // One implementation, in Modal.AskReading.
     async Task AddReading(Meter meter) => await Modal.AskReading(Root, meter);
 
     static string Titlecase(string s) => CultureInfo.InvariantCulture.TextInfo.ToTitleCase(s.ToLowerInvariant());
