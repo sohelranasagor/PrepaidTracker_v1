@@ -23,11 +23,6 @@ public static class Providers
     // DESCO's certificate chain is unreliable. The exception is scoped to DESCO's own
     // hosts: this handler also carries NESCO's POSTs, and accepting anybody's bad
     // certificate because one utility misconfigured theirs is a different decision.
-    //
-    // Now `internal` rather than private: DescoApi carries the authenticated session and
-    // must go through this same host-scoped callback. Giving it its own handler with
-    // validation disabled outright would be a real downgrade, because that connection
-    // now carries a PASSWORD, not just a meter number.
     internal static readonly HttpClient Http = new(new SocketsHttpHandler
     {
         SslOptions = new System.Net.Security.SslClientAuthenticationOptions
@@ -82,7 +77,7 @@ public static class Providers
 //   GET  /api/accounts                       accountId for each linked account
 //   GET  /api/accounts/{id}/summary          customer, address, sanction load
 //   GET  /api/accounts/realtime-balance      FREE: cached balance for every meter on
-//                                            the login + DESCO's verdict on today's
+//                                            the login + DESCO's verdict on the last
 //                                            live read (status, nextEligibleAt)
 //   POST /api/accounts/{id}/realtime-balance asks the meter for a NEW reading;
 //                                            one successful read per meter per day
@@ -91,9 +86,9 @@ public static class Providers
 //
 // Facts that shape everything below:
 //
-//   1. CHECK FIRST, THEN ASK. Exactly like the portal's own page: the free GET says
-//      whether this meter's read for today is used up. If it is, nothing is sent and
-//      the page shows DESCO's limit message. Only an explicit user refresh ever POSTs.
+//   1. CHECK FIRST, THEN ASK — but only trust a verdict that is about TODAY. The free
+//      GET's status describes the last attempt, which can be yesterday's. See ApplyRow.
+//      Only an explicit user refresh ever POSTs.
 //
 //   2. /balance 404s on UNIFIED meters — the portal's own page shows "The requested
 //      resource was not found". We don't call it.
@@ -124,12 +119,7 @@ public class DescoProvider : IProvider
     /// Why a fresh read the user ASKED for produced no new balance — DESCO's HTTP status
     /// and message, a timeout, or the meter not answering. Null when the read worked,
     /// when it was refused by the daily limit (that has its own popup), or when no fresh
-    /// read was requested.
-    ///
-    /// Before this existed, every one of those failures was written to the probe log and
-    /// nowhere else. The sync still "succeeded" with the cached figure, so a refresh that
-    /// DESCO rejected looked identical to one that worked — the portal's own button would
-    /// fetch a new balance while the app's ↻ silently showed yesterday's.
+    /// read was requested. HomePage shows it, so a failed refresh is never silent.
     /// </summary>
     public string? FreshFailure { get; private set; }
 
@@ -167,9 +157,8 @@ public class DescoProvider : IProvider
         {
             // LastKnownState == Ok here means /api/accounts ANSWERED but carried no usable
             // id: a 5xx, a 404, or a body we couldn't read. That is the portal having a bad
-            // minute, not an expired session — and calling it NeedsLogin posted "sign in to
-            // DESCO again" and popped a password prompt over a session that was fine. A real
-            // 401 already arrives here as NeedsLogin, after GetAsync's one re-login retry.
+            // minute, not an expired session. A real 401 already arrives here as
+            // NeedsLogin, after GetAsync's one re-login retry.
             LastState = api.LastKnownState == SessionState.Ok
                 ? SessionState.Unreachable
                 : api.LastKnownState;
@@ -218,20 +207,21 @@ public class DescoProvider : IProvider
         }
         else Log("summary", "no data");
 
-        // ---- balance: the free cached read (also DESCO's verdict on today's read) --
+        // ---- balance: the free cached read (also DESCO's verdict on the last read) --
         if (await CachedRowAsync(api, account, ct) is { } cached)
         {
             ApplyRow(snap, cached);
             Log("realtime(get)", snap.BalanceReported
                 ? $"cached ৳{snap.Balance:0.00} @ {snap.ReadingTime:g}"
+                  + (snap.NextEligible is { } ne ? $", next read after {ne:g}" : "")
                 : "no balance field");
         }
         else Log("realtime(get)", "no meter row");
 
         // ---- fresh read: only when the user explicitly asked ----------------------
-        // Check first, exactly like the portal's own page: the cached row above carries
-        // DESCO's verdict (status DAILY_LIMIT_REACHED + nextEligibleAt). Limited → don't
-        // send anything, just flag it so the page can show the popup.
+        // Blocked only when ApplyRow found a limit that applies NOW. A refused POST costs
+        // nothing anyway — it answers DAILY_LIMIT_REACHED without touching the meter — so
+        // when in doubt, ask.
         if (UserRequestedFresh)
         {
             if (snap.NextEligible is { } until && DateTime.Now < until)
@@ -295,9 +285,6 @@ public class DescoProvider : IProvider
         snap.Recharges = snap.Recharges.OrderBy(r => r.Date, StringComparer.Ordinal).ToList();
 
         // ---- what this portal does NOT give us ----------------------------------
-        // No monthly endpoint and no daily one. Months and Days stay empty, so Forecast
-        // falls through to its own-readings path. There is also no month-to-date figure,
-        // so CurrentMonthConsumption stays 0.
         Log("monthly", "no endpoint on new portal");
         Log("daily", "no endpoint on new portal");
 
@@ -334,13 +321,17 @@ public class DescoProvider : IProvider
     }
 
     /// <summary>
-    /// Balance, read time and DESCO's own verdict on today's live read from a cached
+    /// Balance, read time and DESCO's verdict on the last live read, from a cached
     /// realtime row. Confirmed shape (2026-11-10):
     ///   { accountId, accountNo, meterNo, meterType, status: "DAILY_LIMIT_REACHED",
     ///     message, lastRealtimeBalance, lastRealtimeReceivedAt, nextEligibleAt,
     ///     attemptsToday, remainingAttempts }
-    /// One SUCCESSFUL read locks the meter until midnight Dhaka time even when
-    /// remainingAttempts is still above zero, so status is the authority.
+    ///
+    /// The status describes the LAST attempt, which may be yesterday's. So the meter is
+    /// treated as blocked only when DESCO gives an explicit nextEligibleAt (a past one
+    /// simply means "not blocked any more"), or — with no such field — when a read
+    /// genuinely happened today. Guessing "blocked until midnight" from a stale status
+    /// greyed the refresh button while the portal's own button still worked.
     /// </summary>
     static void ApplyRow(Snapshot snap, JsonElement row)
     {
@@ -358,8 +349,11 @@ public class DescoProvider : IProvider
         var left = FirstString(row, "remainingAttempts");
         var limited = status.Contains("LIMIT", StringComparison.OrdinalIgnoreCase) || left == "0";
 
+        var readToday = snap.ReadingTime is { } rt && DhakaDate(rt) == DhakaDate(DateTime.Now);
+        var explicitNext = ParseIso(FirstString(row, "nextEligibleAt"));
+
         snap.NextEligible = limited
-            ? ParseIso(FirstString(row, "nextEligibleAt")) ?? NextDhakaMidnight()
+            ? explicitNext ?? (readToday ? NextDhakaMidnight() : null)
             : null;
         snap.QuotaKnown = true;   // this sync heard DESCO's verdict, even if it's "not limited"
     }
@@ -367,33 +361,43 @@ public class DescoProvider : IProvider
     /// <summary>
     /// Ask the meter for a new reading. Confirmed shape: the POST answers in a few
     /// seconds with {"status":"SUCCESS","balance":249.27,"receivedAt":"…Z",…} or with
-    /// {"status":"DAILY_LIMIT_REACHED","nextEligibleAt":"…Z",…}. The short poll at the
-    /// end is only a fallback for a reply without a balance, which hasn't been seen.
+    /// {"status":"DAILY_LIMIT_REACHED","nextEligibleAt":"…Z",…}.
+    ///
+    /// When the POST gets no clean answer — a timeout or a server error — the read may
+    /// still have happened on DESCO's side. The POST is never repeated (that could spend
+    /// the day's read twice); instead the FREE cached read is checked for a few seconds
+    /// to see whether a new reading landed.
     ///
     /// Every exit that is neither a success nor a daily-limit refusal sets
-    /// <see cref="FreshFailure"/>, so the person who pressed refresh is told why the
-    /// balance didn't move instead of being shown the cached figure as if it were new.
+    /// <see cref="FreshFailure"/>, so the person who pressed refresh is told why.
     /// </summary>
     async Task FreshReadAsync(DescoApi api, string root, string account, Snapshot snap, CancellationToken ct)
     {
         var before = snap.ReadingTime;
 
         var (fresh, fs, note) = await api.PostAsync(root + Wire.LeafRealtime, ct);
-        if (fs != SessionState.Ok)
+
+        if (fs is SessionState.NeedsLogin or SessionState.Misconfigured)
         {
-            // NeedsLogin is handled by the caller (sign-in prompt). Unreachable used to
-            // vanish here: the page only ever checked for NeedsLogin.
             LastState = fs;
             FreshFailure = note;
             Log("realtime(post)", $"{fs}: {note}");
             return;
         }
-        if (fresh is not { } live)
+
+        if (fs != SessionState.Ok || fresh is not { } live)
         {
-            // DESCO answered with an error status or an unreadable body. The note carries
-            // the HTTP code and the start of DESCO's message.
-            FreshFailure = note;
             Log("realtime(post)", note);
+
+            // No clean answer, but the command may have run. Look, don't resend.
+            var mayHaveRun = note == "timeout" || note.StartsWith("HTTP 5", StringComparison.Ordinal);
+            if (mayHaveRun && await WaitForNewReadAsync(api, account, snap, before, null, ct))
+            {
+                Log("realtime(poll)", $"read landed anyway: ৳{snap.Balance:0.00} @ {snap.ReadingTime:g}");
+                return;
+            }
+
+            FreshFailure = note;
             return;
         }
 
@@ -401,30 +405,27 @@ public class DescoProvider : IProvider
         var reason = FirstString(live, "rateLimitReason");
         var left = FirstString(live, "remainingAttempts");
         var next = ParseIso(FirstString(live, "nextEligibleAt"));
+        var fb = FirstString(live, "balance", "lastRealtimeBalance", "currentBalance");
 
-        // Refused: today's read for this meter is spent, so the cached figure IS current.
-        if (status.Contains("LIMIT", StringComparison.OrdinalIgnoreCase) || reason.Length > 0)
-        {
-            QuotaBlocked = true;
-            snap.NextEligible = next ?? NextDhakaMidnight();
-            Log("realtime(post)", $"{status} {reason}".Trim());
-            return;
-        }
+        var failed = status.Contains("FAIL", StringComparison.OrdinalIgnoreCase)
+                     || status.Contains("ERROR", StringComparison.OrdinalIgnoreCase);
+        var limited = status.Contains("LIMIT", StringComparison.OrdinalIgnoreCase)
+                      || (status.Length == 0 && reason.Length > 0);
 
-        if (status.Contains("FAIL", StringComparison.OrdinalIgnoreCase)
-            || status.Contains("ERROR", StringComparison.OrdinalIgnoreCase))
+        if (failed)
         {
-            // DESCO reached the meter's side and the meter didn't answer. Their message,
-            // when there is one, is the most useful thing we can show.
+            // DESCO tried and the meter didn't answer. Their message, when there is one,
+            // is the most useful thing we can show.
             var msg = FirstString(live, "message", "error", "detail");
             FreshFailure = $"{status} {msg}".Trim();
             Log("realtime(post)", FreshFailure);
             return;
         }
 
-        // SUCCESS: the balance is in the reply.
-        var fb = FirstString(live, "balance", "lastRealtimeBalance", "currentBalance");
-        if (fb.Length > 0)
+        // SUCCESS first: a reply that carries a new balance is a read that happened, even
+        // if it also carries a rate-limit field (it would, once the day's read is spent).
+        // The old order checked rateLimitReason first and could discard a real reading.
+        if (!limited && fb.Length > 0)
         {
             snap.Balance = Providers.Num(fb);
             snap.BalanceReported = true;
@@ -438,9 +439,35 @@ public class DescoProvider : IProvider
             return;
         }
 
-        // Accepted with no balance in the reply — not seen so far. Poll the free cached
-        // read briefly in case the meter reports a moment later.
+        // Refused: today's read for this meter is spent, so the cached figure IS current.
+        if (limited)
+        {
+            QuotaBlocked = true;
+            snap.NextEligible = next ?? NextDhakaMidnight();
+            Log("realtime(post)", $"{status} {reason}".Trim());
+            return;
+        }
+
+        // Accepted with no balance in the reply. Poll the free cached read briefly in case
+        // the meter reports a moment later.
         Log("realtime(post)", (status.Length > 0 ? status : "accepted") + ", waiting for meter");
+        if (await WaitForNewReadAsync(api, account, snap, before, next, ct))
+        {
+            Log("realtime(poll)", $"new read ৳{snap.Balance:0.00} @ {snap.ReadingTime:g}");
+            return;
+        }
+
+        FreshFailure = "meter did not answer within 30 s";
+        Log("realtime(poll)", FreshFailure);
+    }
+
+    /// <summary>
+    /// Check the FREE cached read every 5 s for up to 30 s, looking for a reading newer
+    /// than <paramref name="before"/>. Costs nothing against the daily limit.
+    /// </summary>
+    async Task<bool> WaitForNewReadAsync(DescoApi api, string account, Snapshot snap,
+                                         DateTime? before, DateTime? next, CancellationToken ct)
+    {
         for (int i = 0; i < 6; i++)
         {
             await Task.Delay(TimeSpan.FromSeconds(5), ct);
@@ -450,14 +477,19 @@ public class DescoProvider : IProvider
             if (t is { } tt && (before is not { } b || tt > b))
             {
                 ApplyRow(snap, row);
+                // A read just succeeded, so today's is spent whatever the row said.
                 snap.NextEligible = next ?? NextDhakaMidnight();
-                Log("realtime(poll)", $"new read ৳{snap.Balance:0.00} @ {snap.ReadingTime:g}");
-                return;
+                // The fetch as a whole worked; a transient failure inside the poll must
+                // not leave a stale state behind.
+                LastState = SessionState.Ok;
+                return true;
             }
         }
-        FreshFailure = "meter did not answer within 30 s";
-        Log("realtime(poll)", FreshFailure);
+        return false;
     }
+
+    /// <summary>The calendar date in Dhaka (UTC+6) for a device-local time.</summary>
+    static DateTime DhakaDate(DateTime local) => local.ToUniversalTime().AddHours(6).Date;
 
     /// <summary>Next 00:00 in Dhaka (UTC+6), as device-local time.</summary>
     static DateTime NextDhakaMidnight()

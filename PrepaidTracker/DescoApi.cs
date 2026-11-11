@@ -26,7 +26,9 @@ internal static class Wire
 
     public const string CsrfCookie = "XSRF-TOKEN";
     // Spring Boot's default pairing for an XSRF-TOKEN cookie. The 404 bodies give the
-    // framework away (timestamp / status / error / path), and this header was accepted.
+    // framework away (timestamp / status / error / path), and this header was accepted
+    // on the login POST. See DescoApi.PostAsync for why the realtime POST may need the
+    // MASKED form of the same token.
     public const string CsrfHeader = "X-XSRF-TOKEN";
 
     public const string FieldUser = "username";
@@ -93,8 +95,10 @@ internal static class Wire
     // Different endpoint from the account-scoped POST above, which spends the day's
     // allowance.
     //
-    // Its nextEligibleAt is NOT used to decide whether to POST. Trusting it made the
-    // app skip the live read entirely while the portal's own button still worked.
+    // Its status and nextEligibleAt describe the LAST attempt, which can be yesterday's.
+    // DescoProvider.ApplyRow therefore only treats the meter as blocked when DESCO gives
+    // a future nextEligibleAt, or when a read genuinely happened today. A stale verdict
+    // used to grey the app's refresh while the portal's own button still worked.
     public const string PathRealtimeAll = "/api/accounts/realtime-balance";
 
     public static readonly TimeSpan SessionTtl = TimeSpan.FromMinutes(5);
@@ -112,6 +116,16 @@ public sealed class DescoApi : IDisposable
 {
     static readonly ConcurrentDictionary<string, DescoApi> _live = new();
     static readonly Uri Origin = new(Wire.Base);
+
+    /// <summary>Ordinary calls: summary, transactions, the cached balance, login.</summary>
+    static readonly TimeSpan ReadTimeout = TimeSpan.FromSeconds(30);
+
+    /// <summary>
+    /// The realtime POST asks a physical meter to answer over its own link, which can be
+    /// slow. 30 s cut it off while DESCO was still waiting on the meter; the portal's own
+    /// button just keeps spinning.
+    /// </summary>
+    static readonly TimeSpan PostTimeout = TimeSpan.FromSeconds(60);
 
     public static DescoApi For(string account) => _live.GetOrAdd(account, a => new DescoApi(a));
 
@@ -171,13 +185,23 @@ public sealed class DescoApi : IDisposable
                 }
             }
         };
-        _http = new HttpClient(h) { Timeout = TimeSpan.FromSeconds(30) };
+        // The client-wide ceiling must sit ABOVE the longest per-call limit; each call
+        // applies its own (ReadTimeout or PostTimeout) through Limit() below.
+        _http = new HttpClient(h) { Timeout = TimeSpan.FromSeconds(90) };
         _http.DefaultRequestHeaders.UserAgent.ParseAdd(
             "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1");
         _http.DefaultRequestHeaders.TryAddWithoutValidation("Accept", "application/json, text/plain, */*");
     }
 
     public void Dispose() { _http.Dispose(); _gate.Dispose(); }
+
+    /// <summary>The caller's token plus a per-call time limit.</summary>
+    static CancellationTokenSource Limit(CancellationToken ct, TimeSpan limit)
+    {
+        var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        cts.CancelAfter(limit);
+        return cts;
+    }
 
     // ---- keys. All keyed on the ACCOUNT NUMBER. ----
 
@@ -189,6 +213,22 @@ public sealed class DescoApi : IDisposable
 
     public static bool HasCredential(string account) =>
         Preferences.Get(KHas(account), false);
+
+    // ---- what the realtime POST turned out to need. Portal-wide, so not per account. ----
+
+    /// <summary>Send the CSRF token in Spring Security 6's masked form. Learned on first success.</summary>
+    static bool PostMasked
+    {
+        get => Preferences.Get("desco-post-masked", false);
+        set => Preferences.Set("desco-post-masked", value);
+    }
+
+    /// <summary>Send the POST with no body instead of "{}". Learned on first success.</summary>
+    static bool PostEmptyBody
+    {
+        get => Preferences.Get("desco-post-emptybody", false);
+        set => Preferences.Set("desco-post-emptybody", value);
+    }
 
     // ---- cookie jar, in SecureStorage ----
 
@@ -240,6 +280,34 @@ public sealed class DescoApi : IDisposable
 
     string? Csrf() => _jar.GetCookies(Origin)[Wire.CsrfCookie]?.Value;
 
+    async Task PrimeCsrfAsync(CancellationToken ct)
+    {
+        using var lim = Limit(ct, ReadTimeout);
+        try { using (await _http.GetAsync(Wire.Base + Wire.PathCsrf, lim.Token)) { } }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+        catch { }
+    }
+
+    /// <summary>
+    /// Spring Security 6's BREACH-safe token form (XorCsrfTokenRequestAttributeHandler):
+    /// base64url( random ‖ (random XOR token) ), random being as long as the token's
+    /// UTF-8 bytes. The server reverses the XOR and compares with the cookie's token.
+    ///
+    /// A Spring 6 server configured this way REJECTS the raw cookie value in the header
+    /// with a 403 — which the old code read as a dead session, deleted the cookie jar,
+    /// re-logged in, got 403 again and asked the user for their password. Login can work
+    /// with the raw form while this POST doesn't, because login is often CSRF-exempt.
+    /// </summary>
+    static string Masked(string token)
+    {
+        var tok = Encoding.UTF8.GetBytes(token);
+        var rnd = System.Security.Cryptography.RandomNumberGenerator.GetBytes(tok.Length);
+        var combined = new byte[tok.Length * 2];
+        Buffer.BlockCopy(rnd, 0, combined, 0, rnd.Length);
+        for (int i = 0; i < tok.Length; i++) combined[tok.Length + i] = (byte)(rnd[i] ^ tok[i]);
+        return Convert.ToBase64String(combined).Replace('+', '-').Replace('/', '_');
+    }
+
     // ---- session ----
 
     async Task<SessionState> EnsureAsync(CancellationToken ct)
@@ -290,9 +358,10 @@ public sealed class DescoApi : IDisposable
     /// </summary>
     async Task<bool> ProbeAsync(CancellationToken ct)
     {
+        using var lim = Limit(ct, ReadTimeout);
         try
         {
-            using var r = await _http.GetAsync(Wire.Base + Wire.PathAccounts, ct);
+            using var r = await _http.GetAsync(Wire.Base + Wire.PathAccounts, lim.Token);
             return r.IsSuccessStatusCode;
         }
         catch { return false; }
@@ -324,13 +393,14 @@ public sealed class DescoApi : IDisposable
 
     async Task<SessionState> LoginCoreAsync(string user, string pass, CancellationToken ct)
     {
+        using var lim = Limit(ct, ReadTimeout);
         try
         {
             await LoadJarAsync();
 
             // Prime the CSRF cookie. This answers 204 with no body — the cookie IS the
             // payload, Spring's double-submit pattern.
-            using (await _http.GetAsync(Wire.Base + Wire.PathCsrf, ct)) { }
+            using (await _http.GetAsync(Wire.Base + Wire.PathCsrf, lim.Token)) { }
 
             var csrf = Csrf();
             if (csrf is null) return Diag(SessionState.Misconfigured, "no csrf cookie");
@@ -341,7 +411,7 @@ public sealed class DescoApi : IDisposable
             req.Headers.TryAddWithoutValidation(Wire.CsrfHeader, Uri.UnescapeDataString(csrf));
             req.Headers.Referrer = new Uri(Wire.Base + "/login");
 
-            using var res = await _http.SendAsync(req, ct);
+            using var res = await _http.SendAsync(req, lim.Token);
 
             if (res.StatusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden)
                 return Diag(SessionState.NeedsLogin, "rejected");
@@ -357,7 +427,7 @@ public sealed class DescoApi : IDisposable
             // cookie-based flow has no other way to tell us.
             try
             {
-                var text = await res.Content.ReadAsStringAsync(ct);
+                var text = await res.Content.ReadAsStringAsync(lim.Token);
                 var node = JsonNode.Parse(text);
                 if (node?["authenticated"]?.GetValue<bool>() == false)
                     return Diag(SessionState.NeedsLogin, "authenticated:false");
@@ -437,8 +507,10 @@ public sealed class DescoApi : IDisposable
         var st = await EnsureAsync(ct);
         if (st != SessionState.Ok) return (null, st);
 
+        using var lim = Limit(ct, ReadTimeout);
+
         HttpResponseMessage res;
-        try { res = await _http.GetAsync(Wire.Base + path, ct); }
+        try { res = await _http.GetAsync(Wire.Base + path, lim.Token); }
         catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
         catch { return (null, SessionState.Unreachable); }
 
@@ -455,7 +527,7 @@ public sealed class DescoApi : IDisposable
                 if (!res.IsSuccessStatusCode) return (null, SessionState.Ok);
                 try
                 {
-                    var text = await res.Content.ReadAsStringAsync(ct);
+                    var text = await res.Content.ReadAsStringAsync(lim.Token);
                     using var doc = JsonDocument.Parse(text);
                     // Some endpoints may wrap the payload in { "data": … }; the confirmed
                     // ones return it bare. Handle both.
@@ -483,15 +555,23 @@ public sealed class DescoApi : IDisposable
     /// never be called speculatively: each call either spends the day's allowance or is
     /// refused with DAILY_LIMIT_REACHED.
     ///
-    /// The retry rule is the same single re-login as GetAsync, and it is safe here: a
-    /// refused call changes nothing, and a second attempt after a success simply reports
-    /// ALREADY_SUCCEEDED_TODAY.
+    /// It adapts to what the portal accepts, because the portal's button works and the
+    /// app's request has to match it:
     ///
-    /// Returns a NOTE alongside the result, because this is the one call a person is
-    /// actively waiting on. Every failure used to come back as a bare (null, Ok), so a
-    /// refresh that DESCO rejected looked exactly like a refresh that worked: the cached
-    /// balance stayed on screen and nothing explained why. The note carries the HTTP
-    /// status and the start of DESCO's own error body, so the reason reaches the user.
+    ///   • 403 → resend once with the CSRF token in the OTHER form (raw ↔ masked).
+    ///   • 400 / 415 / 422 → resend once with the OTHER body ("{}" ↔ empty).
+    ///   • Whatever works is remembered, so later refreshes go right first time.
+    ///
+    /// Every one of those is a request the server REJECTED before running it, so a
+    /// resend cannot spend the day's read. Anything that may have run — a timeout, a
+    /// dropped connection, a 5xx — is never resent; the caller checks the free cached
+    /// reading instead to see whether the read landed.
+    ///
+    /// Only after both CSRF forms are refused does it treat the session as dead and do
+    /// the single re-login retry GetAsync does.
+    ///
+    /// The Note says what happened, so a person who pressed refresh can be told why the
+    /// balance didn't move.
     /// </summary>
     public async Task<(JsonElement? Node, SessionState State, string Note)> PostAsync(
         string path, CancellationToken ct, bool isRetry = false)
@@ -499,71 +579,109 @@ public sealed class DescoApi : IDisposable
         var st = await EnsureAsync(ct);
         if (st != SessionState.Ok) return (null, st, st.ToString());
 
-        // The portal clears and re-issues XSRF-TOKEN on every response, and Spring can
-        // leave it absent straight after a login. A POST without the header is a 403,
-        // which the code below would read as a dead session and answer with a pointless
-        // re-login. Make sure a token is in the jar first.
-        if (Csrf() is null)
-        {
-            try { using (await _http.GetAsync(Wire.Base + Wire.PathCsrf, ct)) { } }
-            catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
-            catch { }
-        }
-
-        HttpResponseMessage res;
-        try
-        {
-            using var req = new HttpRequestMessage(HttpMethod.Post, Wire.Base + path)
-            { Content = new StringContent("{}", Encoding.UTF8, "application/json") };
-            if (Csrf() is { } c)
-                req.Headers.TryAddWithoutValidation(Wire.CsrfHeader, Uri.UnescapeDataString(c));
-            req.Headers.Referrer = new Uri(Wire.Base + "/dashboard");
-            res = await _http.SendAsync(req, ct);
-        }
-        catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
-        // HttpClient.Timeout surfaces as a cancellation the caller did NOT ask for.
-        catch (OperationCanceledException) { return (null, SessionState.Unreachable, "timeout"); }
-        catch (Exception e) { return (null, SessionState.Unreachable, e.Message); }
-
+        bool masked = PostMasked, empty = PostEmptyBody;
+        bool triedMask = false, triedBody = false;
         int code;
-        using (res)
+        string text;
+        var trail = new List<string>();
+
+        while (true)
         {
-            code = (int)res.StatusCode;
-            var unauthorized = res.StatusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden;
-            if (!unauthorized)
-            {
-                await SaveJarAsync();
+            var (c, t, error) = await SendPostAsync(path, masked, empty, ct);
 
-                string text = "";
-                try { text = await res.Content.ReadAsStringAsync(ct); }
-                catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
-                catch { }
+            // No answer at all. The command may have reached the meter, so it must not be
+            // sent again — the caller polls the free cached read instead.
+            if (error != null) return (null, SessionState.Unreachable, error);
 
-                if (!res.IsSuccessStatusCode)
-                {
-                    var snippet = System.Text.RegularExpressions.Regex.Replace(text, @"\s+", " ").Trim();
-                    if (snippet.Length > 160) snippet = snippet[..160] + "…";
-                    return (null, SessionState.Ok, $"HTTP {code} {snippet}".Trim());
-                }
+            code = c;
+            text = t;
+            trail.Add($"{(masked ? "masked" : "raw")}{(empty ? "+empty" : "")}:{code}");
 
-                try
-                {
-                    using var doc = JsonDocument.Parse(text);
-                    if (doc.RootElement.ValueKind == JsonValueKind.Object
-                        && doc.RootElement.TryGetProperty("data", out var data)
-                        && data.ValueKind != JsonValueKind.Null)
-                        return (data.Clone(), SessionState.Ok, "ok");
-                    return (doc.RootElement.Clone(), SessionState.Ok, "ok");
-                }
-                catch { return (null, SessionState.Ok, $"HTTP {code} unreadable body"); }
-            }
+            if (code == 403 && !triedMask) { triedMask = true; masked = !masked; continue; }
+            if ((code is 400 or 415 or 422) && !triedBody) { triedBody = true; empty = !empty; continue; }
+            break;
         }
 
-        // 401/403. Outside the using — Recycle may dispose this instance.
-        if (isRetry) return (null, SessionState.NeedsLogin, $"HTTP {code} after re-login");
+        if (code is >= 200 and < 300)
+        {
+            PostMasked = masked;
+            PostEmptyBody = empty;
+            await SaveJarAsync();
+            try
+            {
+                using var doc = JsonDocument.Parse(text);
+                if (doc.RootElement.ValueKind == JsonValueKind.Object
+                    && doc.RootElement.TryGetProperty("data", out var data)
+                    && data.ValueKind != JsonValueKind.Null)
+                    return (data.Clone(), SessionState.Ok, "ok");
+                return (doc.RootElement.Clone(), SessionState.Ok, "ok");
+            }
+            catch { return (null, SessionState.Ok, $"HTTP {code} unreadable body"); }
+        }
+
+        if (code is not (401 or 403))
+        {
+            await SaveJarAsync();
+            return (null, SessionState.Ok,
+                $"HTTP {code} {Snippet(text)}".Trim() + (trail.Count > 1 ? $" [{string.Join(", ", trail)}]" : ""));
+        }
+
+        // 401, or 403 in both CSRF forms: the session itself is refused.
+        if (isRetry) return (null, SessionState.NeedsLogin, "after re-login: " + string.Join(", ", trail));
         _goodUntil = DateTimeOffset.MinValue;
         try { SecureStorage.Remove(KJar(_account)); } catch { }
         return await Recycle(_account).PostAsync(path, ct, isRetry: true);
+    }
+
+    /// <summary>
+    /// One realtime POST, shaped like the portal's own: CSRF header, JSON or empty body,
+    /// and the Origin / Referer / X-Requested-With a browser page sends. Returns the
+    /// status and body, or an Error when no answer came back at all.
+    /// </summary>
+    async Task<(int Code, string Text, string? Error)> SendPostAsync(
+        string path, bool masked, bool emptyBody, CancellationToken ct)
+    {
+        // The portal clears and re-issues XSRF-TOKEN on every response, and Spring can
+        // leave it absent straight after a login or a refusal. Make sure one is in the jar.
+        if (Csrf() is null) await PrimeCsrfAsync(ct);
+
+        using var lim = Limit(ct, PostTimeout);
+        try
+        {
+            using var req = new HttpRequestMessage(HttpMethod.Post, Wire.Base + path)
+            {
+                Content = emptyBody
+                    ? new ByteArrayContent(Array.Empty<byte>())
+                    : new StringContent("{}", Encoding.UTF8, "application/json")
+            };
+
+            if (Csrf() is { } c)
+            {
+                var raw = Uri.UnescapeDataString(c);
+                req.Headers.TryAddWithoutValidation(Wire.CsrfHeader, masked ? Masked(raw) : raw);
+            }
+            req.Headers.Referrer = new Uri(Wire.Base + "/dashboard");
+            req.Headers.TryAddWithoutValidation("Origin", Wire.Base);
+            req.Headers.TryAddWithoutValidation("X-Requested-With", "XMLHttpRequest");
+
+            using var res = await _http.SendAsync(req, lim.Token);
+
+            string text = "";
+            try { text = await res.Content.ReadAsStringAsync(lim.Token); }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+            catch { }
+
+            return ((int)res.StatusCode, text, null);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+        catch (OperationCanceledException) { return (0, "", "timeout"); }
+        catch (Exception e) { return (0, "", e.Message); }
+    }
+
+    static string Snippet(string text)
+    {
+        var s = System.Text.RegularExpressions.Regex.Replace(text ?? "", @"\s+", " ").Trim();
+        return s.Length > 160 ? s[..160] + "…" : s;
     }
 
     /// <summary>Written to Preferences so ProfilePage.DiagText can read it on a device
