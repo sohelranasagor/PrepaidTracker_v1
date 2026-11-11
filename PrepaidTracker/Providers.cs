@@ -120,6 +120,19 @@ public class DescoProvider : IProvider
     /// this meter is reached. HomePage shows the limit popup when it sees this.</summary>
     public bool QuotaBlocked { get; private set; }
 
+    /// <summary>
+    /// Why a fresh read the user ASKED for produced no new balance — DESCO's HTTP status
+    /// and message, a timeout, or the meter not answering. Null when the read worked,
+    /// when it was refused by the daily limit (that has its own popup), or when no fresh
+    /// read was requested.
+    ///
+    /// Before this existed, every one of those failures was written to the probe log and
+    /// nowhere else. The sync still "succeeded" with the cached figure, so a refresh that
+    /// DESCO rejected looked identical to one that worked — the portal's own button would
+    /// fetch a new balance while the app's ↻ silently showed yesterday's.
+    /// </summary>
+    public string? FreshFailure { get; private set; }
+
     /// <summary>What happened last sync, for Profile → Diagnostics.</summary>
     public static string ProbeLog { get; private set; } = "";
 
@@ -135,6 +148,7 @@ public class DescoProvider : IProvider
         _log.Clear();
         LastState = SessionState.Ok;
         QuotaBlocked = false;
+        FreshFailure = null;
 
         var api = DescoApi.For(account);
         var snap = new Snapshot { SyncedAt = DateTime.Now };
@@ -151,16 +165,24 @@ public class DescoProvider : IProvider
 
         if (id <= 0)
         {
+            // LastKnownState == Ok here means /api/accounts ANSWERED but carried no usable
+            // id: a 5xx, a 404, or a body we couldn't read. That is the portal having a bad
+            // minute, not an expired session — and calling it NeedsLogin posted "sign in to
+            // DESCO again" and popped a password prompt over a session that was fine. A real
+            // 401 already arrives here as NeedsLogin, after GetAsync's one re-login retry.
             LastState = api.LastKnownState == SessionState.Ok
-                ? SessionState.NeedsLogin
+                ? SessionState.Unreachable
                 : api.LastKnownState;
-            Log("accounts", "no accountId for " + account);
+            Log("accounts", $"no accountId for {account} ({LastState})");
             ProbeLog = string.Join("\n", _log);
             return new FetchResult
             {
-                Error = LastState == SessionState.Misconfigured
-                    ? L.S("authPortalChanged")
-                    : L.S("authExpiredBody")
+                Error = LastState switch
+                {
+                    SessionState.NeedsLogin => L.S("authExpiredBody"),
+                    SessionState.Misconfigured => L.S("authPortalChanged"),
+                    _ => L.S("authUnreachable")
+                }
             };
         }
 
@@ -347,14 +369,33 @@ public class DescoProvider : IProvider
     /// seconds with {"status":"SUCCESS","balance":249.27,"receivedAt":"…Z",…} or with
     /// {"status":"DAILY_LIMIT_REACHED","nextEligibleAt":"…Z",…}. The short poll at the
     /// end is only a fallback for a reply without a balance, which hasn't been seen.
+    ///
+    /// Every exit that is neither a success nor a daily-limit refusal sets
+    /// <see cref="FreshFailure"/>, so the person who pressed refresh is told why the
+    /// balance didn't move instead of being shown the cached figure as if it were new.
     /// </summary>
     async Task FreshReadAsync(DescoApi api, string root, string account, Snapshot snap, CancellationToken ct)
     {
         var before = snap.ReadingTime;
 
-        var (fresh, fs) = await api.PostAsync(root + Wire.LeafRealtime, ct);
-        if (fs != SessionState.Ok) { LastState = fs; Log("realtime(post)", fs.ToString()); return; }
-        if (fresh is not { } live) { Log("realtime(post)", "POST failed (non-2xx or unreadable)"); return; }
+        var (fresh, fs, note) = await api.PostAsync(root + Wire.LeafRealtime, ct);
+        if (fs != SessionState.Ok)
+        {
+            // NeedsLogin is handled by the caller (sign-in prompt). Unreachable used to
+            // vanish here: the page only ever checked for NeedsLogin.
+            LastState = fs;
+            FreshFailure = note;
+            Log("realtime(post)", $"{fs}: {note}");
+            return;
+        }
+        if (fresh is not { } live)
+        {
+            // DESCO answered with an error status or an unreadable body. The note carries
+            // the HTTP code and the start of DESCO's message.
+            FreshFailure = note;
+            Log("realtime(post)", note);
+            return;
+        }
 
         var status = FirstString(live, "status");
         var reason = FirstString(live, "rateLimitReason");
@@ -373,7 +414,11 @@ public class DescoProvider : IProvider
         if (status.Contains("FAIL", StringComparison.OrdinalIgnoreCase)
             || status.Contains("ERROR", StringComparison.OrdinalIgnoreCase))
         {
-            Log("realtime(post)", status);
+            // DESCO reached the meter's side and the meter didn't answer. Their message,
+            // when there is one, is the most useful thing we can show.
+            var msg = FirstString(live, "message", "error", "detail");
+            FreshFailure = $"{status} {msg}".Trim();
+            Log("realtime(post)", FreshFailure);
             return;
         }
 
@@ -410,7 +455,8 @@ public class DescoProvider : IProvider
                 return;
             }
         }
-        Log("realtime(poll)", "meter did not answer within 30 s");
+        FreshFailure = "meter did not answer within 30 s";
+        Log("realtime(poll)", FreshFailure);
     }
 
     /// <summary>Next 00:00 in Dhaka (UTC+6), as device-local time.</summary>

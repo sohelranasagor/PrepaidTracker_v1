@@ -486,12 +486,18 @@ public sealed class DescoApi : IDisposable
     /// The retry rule is the same single re-login as GetAsync, and it is safe here: a
     /// refused call changes nothing, and a second attempt after a success simply reports
     /// ALREADY_SUCCEEDED_TODAY.
+    ///
+    /// Returns a NOTE alongside the result, because this is the one call a person is
+    /// actively waiting on. Every failure used to come back as a bare (null, Ok), so a
+    /// refresh that DESCO rejected looked exactly like a refresh that worked: the cached
+    /// balance stayed on screen and nothing explained why. The note carries the HTTP
+    /// status and the start of DESCO's own error body, so the reason reaches the user.
     /// </summary>
-    public async Task<(JsonElement? Node, SessionState State)> PostAsync(
+    public async Task<(JsonElement? Node, SessionState State, string Note)> PostAsync(
         string path, CancellationToken ct, bool isRetry = false)
     {
         var st = await EnsureAsync(ct);
-        if (st != SessionState.Ok) return (null, st);
+        if (st != SessionState.Ok) return (null, st, st.ToString());
 
         // The portal clears and re-issues XSRF-TOKEN on every response, and Spring can
         // leave it absent straight after a login. A POST without the header is a 403,
@@ -515,30 +521,46 @@ public sealed class DescoApi : IDisposable
             res = await _http.SendAsync(req, ct);
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
-        catch { return (null, SessionState.Unreachable); }
+        // HttpClient.Timeout surfaces as a cancellation the caller did NOT ask for.
+        catch (OperationCanceledException) { return (null, SessionState.Unreachable, "timeout"); }
+        catch (Exception e) { return (null, SessionState.Unreachable, e.Message); }
 
-        bool unauthorized;
+        int code;
         using (res)
         {
-            unauthorized = res.StatusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden;
+            code = (int)res.StatusCode;
+            var unauthorized = res.StatusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden;
             if (!unauthorized)
             {
                 await SaveJarAsync();
-                if (!res.IsSuccessStatusCode) return (null, SessionState.Ok);
+
+                string text = "";
+                try { text = await res.Content.ReadAsStringAsync(ct); }
+                catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+                catch { }
+
+                if (!res.IsSuccessStatusCode)
+                {
+                    var snippet = System.Text.RegularExpressions.Regex.Replace(text, @"\s+", " ").Trim();
+                    if (snippet.Length > 160) snippet = snippet[..160] + "…";
+                    return (null, SessionState.Ok, $"HTTP {code} {snippet}".Trim());
+                }
+
                 try
                 {
-                    var text = await res.Content.ReadAsStringAsync(ct);
                     using var doc = JsonDocument.Parse(text);
                     if (doc.RootElement.ValueKind == JsonValueKind.Object
                         && doc.RootElement.TryGetProperty("data", out var data)
                         && data.ValueKind != JsonValueKind.Null)
-                        return (data.Clone(), SessionState.Ok);
-                    return (doc.RootElement.Clone(), SessionState.Ok);
+                        return (data.Clone(), SessionState.Ok, "ok");
+                    return (doc.RootElement.Clone(), SessionState.Ok, "ok");
                 }
-                catch { return (null, SessionState.Ok); }
+                catch { return (null, SessionState.Ok, $"HTTP {code} unreadable body"); }
             }
         }
-        if (isRetry) return (null, SessionState.NeedsLogin);
+
+        // 401/403. Outside the using — Recycle may dispose this instance.
+        if (isRetry) return (null, SessionState.NeedsLogin, $"HTTP {code} after re-login");
         _goodUntil = DateTimeOffset.MinValue;
         try { SecureStorage.Remove(KJar(_account)); } catch { }
         return await Recycle(_account).PostAsync(path, ct, isRetry: true);

@@ -7,16 +7,19 @@ using Microsoft.Maui.Controls.Shapes;
 using Microsoft.Maui.Graphics;
 using Microsoft.Maui.Networking;
 using System;
+using System.Drawing;
 using System.Globalization;
-// Implicit usings bring System.IO.Path into scope; we mean the drawable shape.
-using Path = Microsoft.Maui.Controls.Shapes.Path;
-// iOSSpecific also defines a ScrollView (platform-config statics); alias the control.
-using ScrollView = Microsoft.Maui.Controls.ScrollView;
+using System.Reflection;
+using System.Security.Cryptography;
 // System.Drawing is in scope on iOS via implicit usings, so these three names are
 // ambiguous without an alias. Same reason as the two above.
 using Color = Microsoft.Maui.Graphics.Color;
-using Point = Microsoft.Maui.Graphics.Point;
 using Label = Microsoft.Maui.Controls.Label;
+// Implicit usings bring System.IO.Path into scope; we mean the drawable shape.
+using Path = Microsoft.Maui.Controls.Shapes.Path;
+using Point = Microsoft.Maui.Graphics.Point;
+// iOSSpecific also defines a ScrollView (platform-config statics); alias the control.
+using ScrollView = Microsoft.Maui.Controls.ScrollView;
 
 namespace PrepaidTracker;
 
@@ -106,11 +109,12 @@ public class HomePage : AppPage
         var snap = Store.Snapshot(m.Id);
         return string.Join('|', m.Id, Store.Meters().Count, Store.Readings(m.Id).Count,
             snap?.SyncedAt.Ticks ?? 0, Store.Language, Store.TargetDays,
-            // Every Profile setting the header reads has to be in this token, or
-            // editing it there leaves a stale card here. LowTaka AND LowDays both
-            // decide whether the banner shows at all (see `low` in Render); Tariff
+            // Every setting the header reads has to be in this token, or editing it
+            // leaves a stale card here. The low banner uses the meter's EFFECTIVE
+            // thresholds, which depend on both the app-wide defaults and the meter's own
+            // overrides set in the notification sheet — so all four belong here. Tariff
             // feeds Forecast.
-            Store.LowTaka, Store.LowDays, Store.Tariff ?? 0,
+            Store.LowTaka, Store.LowDays, m.LowTaka, m.LowDays, Store.Tariff ?? 0,
             // A sync can settle a failed recharge without moving anything else this token
             // watches. Without the stamp the verdict is written to disk and the open page
             // never redraws — the banner would appear only after a tab switch.
@@ -150,6 +154,16 @@ public class HomePage : AppPage
 
     bool _syncing;
 
+    /// <summary>
+    /// A fresh read the user asked for while another sync was already running.
+    ///
+    /// The old guard was a bare `if (_syncing) return;`. Opening the app starts a silent
+    /// cached sync; a pull or ↻ tap that landed during it was thrown away without a word
+    /// — the spinner stopped, no live read was sent, and the balance stayed exactly where
+    /// it was. Now the request is remembered and run as soon as the current sync ends.
+    /// </summary>
+    bool _freshQueued;
+
     /// <param name="silent">No error modal — used by the on-appear auto-sync.</param>
     /// <param name="userRequestedFresh">
     /// True only when the person tapped refresh or pulled down. DESCO allows one fresh
@@ -158,13 +172,30 @@ public class HomePage : AppPage
     /// </param>
     public async Task Sync(bool silent = false, bool userRequestedFresh = false)
     {
+        // Pull-to-refresh, the ↻ button, and the on-appear auto-sync can all land at
+        // once; two fetches in flight interleave status updates and double-record the
+        // day's reading. A cached request arriving mid-sync is redundant and can be
+        // dropped; a FRESH one is the user asking for something the running sync won't
+        // do, so it is queued.
+        if (_syncing)
+        {
+            _freshQueued |= userRequestedFresh;
+            return;
+        }
+
+        await SyncCore(silent, userRequestedFresh);
+
+        if (_freshQueued)
+        {
+            _freshQueued = false;
+            await SyncCore(silent: false, userRequestedFresh: true);
+        }
+    }
+
+    async Task SyncCore(bool silent, bool userRequestedFresh)
+    {
         var meter = Store.Selected();
         if (meter == null) return;
-
-        // Pull-to-refresh, the ↻ button, and the on-appear auto-sync can all
-        // land at once; two fetches in flight interleave status updates and
-        // double-record the day's reading.
-        if (_syncing) return;
 
         // A DESCO meter with no stored sign-in can't fetch anything. Ask here rather
         // than letting the fetch fail with an auth error: the user added this account
@@ -219,7 +250,7 @@ public class HomePage : AppPage
             if (await DescoSignIn.PromptAsync(this, meter))
             {
                 Notifier.ClearSessionWarning(meter.Id);
-                await Sync(silent, userRequestedFresh);   // exactly one retry
+                await SyncCore(silent, userRequestedFresh);   // exactly one retry
             }
             return;
         }
@@ -274,6 +305,14 @@ public class HomePage : AppPage
         // way the portal does. Not awaited, so the pull-to-refresh spinner can settle.
         if (!silent && provider is DescoProvider q && q.QuotaBlocked)
             _ = ShowQuotaPopup(meter, result.Snapshot);
+
+        // The user asked for a fresh read and it did NOT produce a new balance for any
+        // other reason — DESCO answered with an error, timed out, or the meter didn't
+        // respond. Every one of these used to be silent: the cached figure stayed on
+        // screen looking exactly like a successful refresh. Say what happened, with
+        // DESCO's own status, so "why didn't it update?" has an answer.
+        if (!silent && provider is DescoProvider fr && fr.FreshFailure is { } why)
+            _ = Modal.Info(Root, L.S("quotaTitle"), L.S("freshFailed", why));
     }
 
     // ---------------- render ----------------
@@ -300,8 +339,13 @@ public class HomePage : AppPage
         var meter = Store.Selected()!;
         var snap = Store.Snapshot(meter.Id);
         var f = Forecast.Build(Store.Readings(meter.Id), snap);
+
+        // The meter's EFFECTIVE thresholds — its own override if set, otherwise the app
+        // default — the same figures Notifier alerts on. Using the app-wide values here
+        // made the banner and the notification disagree for any customised meter.
         bool low = snap is not { BalanceReported: false }
-                   && ((f?.DaysLeft is { } d && d < Store.LowDays) || (f != null && f.Balance < Store.LowTaka));
+                   && ((f?.DaysLeft is { } d && d < meter.EffectiveLowDays)
+                       || (f != null && f.Balance < meter.EffectiveLowTaka));
 
         RenderHeader(meter, snap, f, low);
 

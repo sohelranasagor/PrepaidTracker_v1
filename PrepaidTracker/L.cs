@@ -62,7 +62,7 @@ public static class L
         ["authSignOutQ"] = ("Sign out of DESCO? You'll need your password to sync this meter again.",
                                "ডেসকো থেকে সাইন আউট করবেন? এই মিটার আবার সিঙ্ক করতে পাসওয়ার্ড লাগবে।"),
         ["authNeeded"] = ("Sign in to see this meter's balance.",
-                               "এই মিটারের ব্যালেন্স দেখতে সাইন ইন করুন."),
+                               "এই মিটারের ব্যালেন্স দেখতে সাইন ইন করুন।"),
 
         // ---- the live-read limit ----
         // DESCO allows one successful fresh meter reading per meter per day. Everything
@@ -72,6 +72,12 @@ public static class L
         ["quotaTitle"] = ("Realtime balance", "রিয়েলটাইম ব্যালেন্স"),
         ["quotaReachedMeter"] = ("Today's realtime balance request limit for meter {0} has been reached.\nYou can request another reading after {1}.",
                                  "মিটার {0}-এর আজকের রিয়েলটাইম ব্যালেন্স অনুরোধের সীমা শেষ হয়েছে।\n{1}-এর পর আবার রিডিং নিতে পারবেন।"),
+        // A refresh the user asked for that produced no new balance for any reason OTHER
+        // than the daily limit. {0} is DESCO's own status — "HTTP 500 …", "timeout",
+        // "FAILED …" — left in Latin on purpose: it is what the developer needs to see
+        // in a screenshot, and translating it would hide the one useful part.
+        ["freshFailed"] = ("DESCO didn't return a new reading ({0}). Showing the last saved balance.",
+                           "ডেসকো নতুন রিডিং দেয়নি ({0})। সর্বশেষ সংরক্ষিত ব্যালেন্স দেখানো হচ্ছে।"),
 
         // home
         ["welcome"] = ("Welcome", "স্বাগতম"),
