@@ -1,4 +1,4 @@
-﻿namespace PrepaidTracker;
+namespace PrepaidTracker;
 
 /// <summary>
 /// The DESCO sign-in flow. Two steps, because DESCO's rebuilt portal needs an account
@@ -45,12 +45,13 @@ public static class DescoSignIn
         var user = await Modal.Prompt(page.Root, L.S("authTitle"), L.S("authUserHint"));
         if (string.IsNullOrWhiteSpace(user)) return false;
 
-        var pass = await Modal.Prompt(page.Root, L.S("authTitle"), L.S("authPassHint"));
+        // Masked, with spell-check and prediction off: the password must not be shown on
+        // screen or learned by the keyboard.
+        var pass = await Modal.Prompt(page.Root, L.S("authTitle"), L.S("authPassHint"), secret: true);
         if (string.IsNullOrWhiteSpace(pass)) return false;
 
-        // A free Render-style cold start isn't in play here — this is DESCO's own
-        // server — but a government portal on a bad mobile connection still deserves a
-        // generous window before we call it unreachable.
+        // A government portal on a bad mobile connection deserves a generous window
+        // before we call it unreachable.
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(60));
 
         SessionState st;
