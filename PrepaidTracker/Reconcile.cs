@@ -15,15 +15,14 @@ namespace PrepaidTracker;
 ///
 /// From the app's side the second and third look identical, and both are answered the
 /// same way: tell the user to enter the token by hand. Only the meter can settle which
-/// of the three it was, and it only speaks once a day.
+/// of the three it was.
 /// </summary>
 public enum CreditState
 {
     /// <summary>
-    /// No meter read dated after the recharge exists yet, so the question is not
+    /// No meter read taken after the recharge exists yet, so the question is not
     /// answerable. This is NOT "it failed" — showing the manual-token prompt here
-    /// would nag every user on every failed row for up to 24 hours before we have
-    /// any evidence at all.
+    /// would nag every user on every failed row before we have any evidence at all.
     /// </summary>
     Unverified,
 
@@ -40,13 +39,10 @@ public enum CreditState
     /// twelve of them, under sequence "-3~9", in the captured data. Its Amount does not
     /// correspond to a single credit landing on a single balance, so every rule in
     /// <see cref="Reconcile.Run"/> would be arithmetic on a number that doesn't mean
-    /// what it looks like: the balance could rise by the full amount, by part of it, or
-    /// not at all, and none of those outcomes would tell us anything.
+    /// what it looks like.
     ///
     /// So we record it, show every token (the user has to key all of them), and make no
-    /// claim about whether it landed. Silence is the honest answer here — a confident
-    /// wrong verdict costs either a wasted trip to the meter or a user who thinks they
-    /// have power and doesn't.
+    /// claim about whether it landed.
     /// </summary>
     Informational
 }
@@ -78,23 +74,22 @@ public class Verdict
 ///
 ///   1. A failed recharge is credited to the LIVE ESTIMATE immediately, exactly like a
 ///      successful one, because the odds are good the money arrived. The estimate is
-///      the only number in the app allowed to be optimistic — it is explicitly a
-///      projection, and it is marked as provisional while it carries unverified money.
+///      the only number in the app allowed to be optimistic, and it is marked as
+///      provisional while it carries unverified money.
 ///   2. It never touches <see cref="Store.AddReading"/>, the EWMA, or the alerts on the
 ///      way in. Those run on measured figures only.
 ///   3. The very next meter read settles it, and the verdict is written down.
 ///
 /// The verdict has to be PERSISTED rather than recomputed, because both portals return
-/// a rolling window of recharges. The failed row that is visible today can be gone
-/// tomorrow, and the reading it was compared against will eventually roll out of the
-/// log too — recomputing from whatever happens to be in the current snapshot would let
-/// a settled row flip back to Unverified, re-fire its notification, and re-raise its
-/// banner. Decided once, never re-litigated.
+/// a rolling window of recharges — recomputing from whatever happens to be in the
+/// current snapshot would let a settled row flip back to Unverified, re-fire its
+/// notification, and re-raise its banner. Decided once, never re-litigated.
 ///
-/// DESCO's rebuilt portal changed two inputs here, both for the better: tokens now
-/// arrive as a first-class field instead of buried in detail keys, and energyAmount is
-/// published on every row including failed ones. It also introduced the multi-token
-/// transaction — see <see cref="CreditState.Informational"/>.
+/// "Before" and "after" a read are decided by MOMENT where both the recharge time and
+/// the read time are known (<see cref="Forecast.After"/>). DESCO's live read happens at
+/// any hour, so a recharge at 08:00 is already inside a 09:05 read on the same day.
+/// The old date-only rule treated that read as pre-recharge, saw no rise after it, and
+/// raised "enter the token manually" for money that had already landed.
 /// </summary>
 public static class Reconcile
 {
@@ -105,23 +100,18 @@ public static class Reconcile
     ///
     /// DESCO's new feed carries a genuinely stable orderId, which would be a better key.
     /// It is deliberately NOT used: changing the key orphans every verdict already on
-    /// disk, so every settled row would revert to Unverified, re-raise its banner and
-    /// re-fire its notification days or weeks after the user dealt with it. The orderId
-    /// is carried on the row (<see cref="RechargeRow.OrderId"/>) as the migration target
-    /// if that is ever done deliberately, with a conversion pass over the stored map.
+    /// disk. The orderId is carried on the row (<see cref="RechargeRow.OrderId"/>) as the
+    /// migration target if that is ever done deliberately.
     /// </summary>
     public static string KeyOf(RechargeRow r) => $"{r.Date}|{r.Time}|{r.Amount:0.##}|{r.Via}";
 
     /// <summary>
     /// Electricity this recharge would put on the meter. The portal usually reports it
-    /// outright (DESCO reports it on failed rows too — a would-have-been figure); when
-    /// it doesn't, gross it down by the same observed credit ratio the suggestion engine
-    /// uses, rather than the VAT constant.
+    /// outright (DESCO reports it on failed rows too); when it doesn't, gross it down by
+    /// the same observed credit ratio the suggestion engine uses.
     ///
     /// Nothing is subtracted for the demand charge: DESCO's energyAmount already excludes
-    /// it. Verified across 24 captured recharges — ৳600 with no demand charge credits
-    /// ৳574.27, ৳400 with ৳168 of demand charge credits ৳214.85, and both satisfy
-    /// energyAmount = totalAmount × 0.95712 − demandCharge.
+    /// it (energyAmount = totalAmount × 0.95712 − demandCharge, verified across 24 rows).
     /// </summary>
     public static double Energy(RechargeRow r, Snapshot? snap) =>
         r.EnergyAmount > 0 ? r.EnergyAmount : r.Amount * Forecast.CreditRatio(snap);
@@ -149,30 +139,26 @@ public static class Reconcile
     /// <summary>
     /// Energy from failed recharges that is currently riding on the live estimate on
     /// trust. Added by <see cref="Forecast.LiveEstimate"/>; also drives the amber dot on
-    /// the chip, because a number that might be ৳478 wrong should not look as settled as
-    /// one that can't be.
+    /// the chip.
     ///
-    /// The window is the same one the success path uses — recharges dated at or after the
-    /// meter's last read — and that window is what makes the optimism self-expiring. A
-    /// recharge dated D sits in the estimate until the read dated D+1 lands; from that
-    /// moment the recharge is BEHIND the read date, so it drops out of this sum whether
-    /// it landed or not, and the measured balance is the answer either way. The verdict
-    /// check below is belt-and-braces for a portal that republishes an older read time.
+    /// The window is the same one the success path uses — recharges made AFTER the meter's
+    /// last read, by moment where the recharge has a time (<see cref="Forecast.AfterRead"/>)
+    /// — and that window is what makes the optimism self-expiring: once a read is taken
+    /// after the recharge, it drops out of this sum whether it landed or not, and the
+    /// measured balance is the answer either way.
     ///
-    /// Key-change sets are excluded: their Amount is not a credit, and adding it to the
-    /// projected balance would make the chip hundreds of taka optimistic for a full day.
+    /// Key-change sets are excluded: their Amount is not a credit.
     /// </summary>
     public static double UnverifiedCredit(string meterId, Snapshot? snap)
     {
         if (snap?.ReadingTime is not { } readAt) return 0;
 
-        var readDate = readAt.ToString("yyyy-MM-dd");
         var verdicts = Store.Verdicts(meterId);
 
         return snap.Recharges
             .Where(r => !r.Success
                      && !r.MultiToken
-                     && string.CompareOrdinal(r.Date, readDate) >= 0
+                     && Forecast.AfterRead(r, readAt)
                      && (!verdicts.TryGetValue(KeyOf(r), out var v) || v.State != CreditState.NotCredited))
             .Sum(r => Energy(r, snap));
     }
@@ -197,14 +183,10 @@ public static class Reconcile
     }
 
     /// <summary>
-    /// The STS token for this recharge. "Enter the token manually" is useless advice on
-    /// its own — the whole point is that the app already holds the twenty digits and can
-    /// put them on screen.
-    ///
-    /// DESCO's new feed publishes the token as its own field, so that is tried first.
-    /// The detail-key scrape stays as the fallback: NESCO's HTML table still buries it
-    /// among labelled cells, and upgrading installs hold old snapshots that predate the
-    /// Tokens array.
+    /// The STS token for this recharge. DESCO's new feed publishes the token as its own
+    /// field, so that is tried first. The detail-key scrape stays as the fallback: NESCO's
+    /// HTML table still buries it among labelled cells, and upgrading installs hold old
+    /// snapshots that predate the Tokens array.
     /// </summary>
     public static string? TokenOf(RechargeRow r)
     {
@@ -226,8 +208,7 @@ public static class Reconcile
 
     /// <summary>
     /// Every token on the row, each grouped for keying. A key-change set carries twelve;
-    /// rendering them as one 240-digit run is unusable, and showing only the first is
-    /// worse — the meter needs all of them, in order, and the user has no other copy.
+    /// the meter needs all of them, in order, and the user has no other copy.
     /// </summary>
     public static List<string> AllTokens(RechargeRow r)
     {
@@ -258,7 +239,7 @@ public static class Reconcile
     /// <summary>
     /// Cheap fingerprint of this meter's verdicts, for the pages' StateToken. Without it
     /// a sync that flips a row to NotCredited writes the banner to disk and the open page
-    /// never redraws — the user sees it only after switching tabs.
+    /// never redraws.
     /// </summary>
     public static string Stamp(string meterId)
     {
@@ -292,20 +273,14 @@ public static class Reconcile
         {
             var key = KeyOf(r);
 
-            // A row with no usable date cannot be windowed at all: LastOrDefault against
-            // an empty string matches nothing and FirstOrDefault matches the very first
-            // reading ever taken, so `burn` would become the entire log's consumption and
-            // rule 1 would credit almost anything. Skip rather than guess.
+            // A row with no usable date cannot be windowed at all. Skip rather than guess.
             if (r.Date.Length < 10) continue;
 
-            // Settled rows are never revisited. See the class comment: the evidence that
-            // produced the verdict rolls out of the window long before the row does.
+            // Settled rows are never revisited. See the class comment.
             if (verdicts.TryGetValue(key, out var existing) && existing.State != CreditState.Unverified)
                 continue;
 
             // A key-change set is RECORDED, never decided — its amount isn't one credit.
-            // Written once so the UI can list its tokens and so this loop skips it on
-            // every later sync via the settled-row check above.
             if (r.MultiToken)
             {
                 if (existing == null)
@@ -322,26 +297,22 @@ public static class Reconcile
                 continue;
             }
 
-            // Balances are midnight snapshots, so a recharge dated D happens DURING day D —
-            // hours after that day's read — and cannot appear before the read dated D+1.
-            // `prior` is therefore the last read at or before D (pre-recharge by
-            // construction) and `after` the first read strictly past it. Same window rule
-            // as Sync.Record, and it has to stay the same or the two disagree about which
-            // interval owns the money.
-            var prior = readings.LastOrDefault(x => string.CompareOrdinal(x.Date, r.Date) <= 0);
-            var after = readings.FirstOrDefault(x => string.CompareOrdinal(x.Date, r.Date) > 0);
+            // `prior` is the last read taken BEFORE the recharge (so its balance does not
+            // contain it), `after` the first read taken AFTER it. Decided by moment where
+            // both times are known, by date otherwise. Same rule as Sync.Record — the two
+            // must agree about which interval owns the money.
+            var prior = readings.LastOrDefault(x => Forecast.After(r, x));
+            var after = readings.FirstOrDefault(x => !Forecast.After(r, x));
 
             if (prior == null || after == null)
             {
                 // Not knowable yet — either the recharge predates our whole log, or the
-                // meter hasn't spoken since. Hold Unverified and try again next sync.
+                // meter hasn't been read since. Hold Unverified and try again next sync.
                 // Emphatically NOT NotCredited: that would put "enter the token manually"
-                // on screen minutes after a recharge, before any evidence exists.
+                // on screen before any evidence exists.
                 //
-                // Worth knowing that this state now lasts LONGER on DESCO than it used
-                // to. The portal rations live reads to about one a day, so `after` can be
-                // most of a day away even when the user is actively watching — which is
-                // exactly the window this state was designed to describe honestly.
+                // On DESCO this state lasts until the next LIVE read — the cached figure
+                // does not move on its own.
                 if (!verdicts.ContainsKey(key))
                 {
                     verdicts[key] = new Verdict { State = CreditState.Unverified, Energy = Energy(r, snap) };
@@ -353,19 +324,23 @@ public static class Reconcile
             var energy = Energy(r, snap);
             if (energy <= 0) continue;                    // nothing to look for
 
-            var days = Math.Max(1, (Forecast.Date(after.Date) - Forecast.Date(prior.Date)).Days);
+            // The interval's length, in hours where both reads carry a time. DESCO's live
+            // reads land at arbitrary hours, so two reads on consecutive dates can be 2 h
+            // apart or 46 h apart; counting whole dates over- or under-states burn.
+            double days = prior.ReadAt is { } p && after.ReadAt is { } a
+                ? Math.Max(0.25, (a - p).TotalDays)
+                : Math.Max(1, (Forecast.Date(after.Date) - Forecast.Date(prior.Date)).Days);
             var burn = Math.Max(0, rate) * days;
 
             // Anything ELSE in the same interval that we know landed has to come out
             // first, or two recharges bracketed by one pair of readings each explain the
             // other's rise and both get marked Credited off a single credit.
-            // Key-change sets are excluded here too: subtracting their notional amount
-            // would make a genuine credit in the same interval look unexplained.
+            // Key-change sets are excluded here too.
             var others = snap.Recharges
                 .Where(x => KeyOf(x) != key
                          && !x.MultiToken
-                         && string.CompareOrdinal(x.Date, prior.Date) >= 0
-                         && string.CompareOrdinal(x.Date, after.Date) < 0
+                         && Forecast.After(x, prior)
+                         && !Forecast.After(x, after)
                          && (x.Success
                              || (verdicts.TryGetValue(KeyOf(x), out var ov) && ov.State == CreditState.Credited)))
                 .Sum(x => Energy(x, snap));
@@ -376,19 +351,13 @@ public static class Reconcile
             var observed = after.Balance - prior.Balance + burn - others;
 
             // Rule 1 — the rate-aware test. Half the energy is the midpoint between the
-            // two hypotheses, which is the right place to cut: it tolerates a day that
-            // burned twice the average without ever mistaking burn for a ৳478 credit.
+            // two hypotheses, which is the right place to cut.
             bool landed = observed >= energy * 0.5;
 
             // Rule 2 — the naive comparison, fenced to the case where it is sound. When
             // the recharge is worth more than the entire interval's consumption, a credit
             // that landed CANNOT leave the balance at or below where it started; if it
-            // did, rule 1 was fooled. This is the guard against a wild `burn`: a long gap
-            // between readings, or an EWMA inflated by a heat wave, inflates `burn` until
-            // rule 1 would say yes to almost anything. Where the recharge is genuinely
-            // smaller than the interval's burn the raw comparison is meaningless and is
-            // skipped — both halves are covered by test cases and dropping either one
-            // breaks a real scenario.
+            // did, rule 1 was fooled by an inflated `burn`.
             if (energy > burn && after.Balance <= prior.Balance) landed = false;
 
             var state = landed ? CreditState.Credited : CreditState.NotCredited;
