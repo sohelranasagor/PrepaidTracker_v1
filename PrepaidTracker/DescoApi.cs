@@ -12,7 +12,7 @@ internal static class Wire
 
     // =====================================================================
     // CONFIRMED by tools/DescoProbe against account 41392222, 2026-11-09,
-    // and by the portal's own network traffic, 2026-11-10.
+    // and by the portal's own network traffic, 2026-11-10 and 2026-11-11.
     // =====================================================================
 
     // Answers 204 and sets the XSRF-TOKEN cookie. Note it is NOT under /api —
@@ -25,24 +25,21 @@ internal static class Wire
     public const string PathLogin = "/api/auth/login";
 
     public const string CsrfCookie = "XSRF-TOKEN";
-    // Spring Boot's default pairing for an XSRF-TOKEN cookie. The 404 bodies give the
-    // framework away (timestamp / status / error / path), and this header was accepted
-    // on the login POST. See DescoApi.PostAsync for why the realtime POST may need the
-    // MASKED form of the same token.
+    // Spring Boot's default pairing for an XSRF-TOKEN cookie. The portal sends the RAW
+    // cookie value in this header (confirmed 2026-11-11: header == cookie).
     public const string CsrfHeader = "X-XSRF-TOKEN";
 
     public const string FieldUser = "username";
     public const string FieldPass = "password";
 
     // 200. Returns { accounts: [ { accountId, accountNo, meterNo, status, … } ], … }.
-    // Also doubles as the session probe, because /api/session does not exist here.
+    // Also doubles as the session probe.
     public const string PathAccounts = "/api/accounts";
 
-    // Every data endpoint is scoped to the INTERNAL accountId (15539), not the account
-    // number the customer knows (41392222). Passing the account number returns 403 on
-    // every leaf, so resolving the id through /api/accounts first is mandatory rather
-    // than an optimisation. It is also why the DevTools Network tab made the paths look
-    // top-level — it only renders the last segment.
+    // Every data endpoint is scoped to the INTERNAL accountId (15539, 17840), not the
+    // account number the customer knows (41392222, 41392223). Passing the account number
+    // returns 403 on every leaf, so resolving the id through /api/accounts first is
+    // mandatory rather than an optimisation.
     public static string Acct(long accountId) => $"/api/accounts/{accountId}";
 
     // 200 (GET). customerName, installationAddress, meterNo, sanctionLoad ("4"),
@@ -58,18 +55,21 @@ internal static class Wire
 
     // POST ONLY — every GET returns 500.
     //
-    // A COMMAND, not a query: it asks the meter for a fresh reading and spends that
-    // meter's daily allowance — one successful read per meter per day, the next one
-    // allowed after midnight Dhaka time. Each meter has its own allowance. Call it only
-    // on explicit user action.
+    // A COMMAND, not a query: it asks the meter for a fresh reading. One SUCCESSFUL read
+    // per meter per day, out of three attempts; the next is allowed after midnight Dhaka
+    // time. Each meter has its own allowance. Call it only on explicit user action.
     //
-    // CONFIRMED 2026-11-10. Success answers in ~3 s with ONE JSON object (not a stream):
+    // BODY IS REQUIRED: {"idempotencyKey":"<uuid>"} with Content-Type application/json,
+    // a fresh UUID per user tap. Without it DESCO answers 500 INTERNAL_ERROR — confirmed
+    // 2026-11-11 by comparing the app's failing request with the portal's working one.
+    //
+    // Success answers in ~3 s with ONE JSON object:
     //   {"status":"SUCCESS","requestId":"…","meterNo":"…","meterType":"UNIFIED",
-    //    "balance":249.27,"requestedAt":"…Z","receivedAt":"…Z","source":"REALTIME",
-    //    "remainingAttempts":1}
+    //    "balance":1422.58,"requestedAt":"…Z","receivedAt":"…Z","source":"REALTIME",
+    //    "remainingAttempts":2}
     // A refusal also answers 200:
     //   {"status":"DAILY_LIMIT_REACHED","meterNo":"…","source":"REALTIME",
-    //    "nextEligibleAt":"2026-11-09T18:00:00Z","rateLimitReason":"ALREADY_SUCCEEDED_TODAY"}
+    //    "nextEligibleAt":"2026-11-11T18:00:00Z","rateLimitReason":"ALREADY_SUCCEEDED_TODAY"}
     //
     // Every response ROTATES the XSRF-TOKEN cookie (cleared, then re-issued in the same
     // response), so the header must always be read fresh from the jar, never cached.
@@ -91,14 +91,14 @@ internal static class Wire
     // /consumption/daily all 404. Snapshot.Days and Snapshot.Months therefore stay
     // empty, and Forecast falls through to its own-readings path.
 
-    // Collection-level and FREE: returns the cached reading for every linked meter.
-    // Different endpoint from the account-scoped POST above, which spends the day's
-    // allowance.
+    // Collection-level and FREE: returns the cached reading for every linked meter,
+    // wrapped as { enabled, meters: [ { accountId, accountNo, meterNo, status
+    // ("AVAILABLE" / "DAILY_LIMIT_REACHED"), message, lastRealtimeBalance,
+    // lastRealtimeReceivedAt, nextEligibleAt, attemptsToday, remainingAttempts } ] }.
+    // Different endpoint from the account-scoped POST above, which spends an attempt.
     //
-    // Its status and nextEligibleAt describe the LAST attempt, which can be yesterday's.
-    // DescoProvider.ApplyRow therefore only treats the meter as blocked when DESCO gives
-    // a future nextEligibleAt, or when a read genuinely happened today. A stale verdict
-    // used to grey the app's refresh while the portal's own button still worked.
+    // The cached figure does NOT advance on its own: it changes only when someone asks
+    // for a live read, in this app or on DESCO's website.
     public const string PathRealtimeAll = "/api/accounts/realtime-balance";
 
     public static readonly TimeSpan SessionTtl = TimeSpan.FromMinutes(5);
@@ -214,22 +214,6 @@ public sealed class DescoApi : IDisposable
     public static bool HasCredential(string account) =>
         Preferences.Get(KHas(account), false);
 
-    // ---- what the realtime POST turned out to need. Portal-wide, so not per account. ----
-
-    /// <summary>Send the CSRF token in Spring Security 6's masked form. Learned on first success.</summary>
-    static bool PostMasked
-    {
-        get => Preferences.Get("desco-post-masked", false);
-        set => Preferences.Set("desco-post-masked", value);
-    }
-
-    /// <summary>Send the POST with no body instead of "{}". Learned on first success.</summary>
-    static bool PostEmptyBody
-    {
-        get => Preferences.Get("desco-post-emptybody", false);
-        set => Preferences.Set("desco-post-emptybody", value);
-    }
-
     // ---- cookie jar, in SecureStorage ----
 
     string JarFingerprint() =>
@@ -288,26 +272,6 @@ public sealed class DescoApi : IDisposable
         catch { }
     }
 
-    /// <summary>
-    /// Spring Security 6's BREACH-safe token form (XorCsrfTokenRequestAttributeHandler):
-    /// base64url( random ‖ (random XOR token) ), random being as long as the token's
-    /// UTF-8 bytes. The server reverses the XOR and compares with the cookie's token.
-    ///
-    /// A Spring 6 server configured this way REJECTS the raw cookie value in the header
-    /// with a 403 — which the old code read as a dead session, deleted the cookie jar,
-    /// re-logged in, got 403 again and asked the user for their password. Login can work
-    /// with the raw form while this POST doesn't, because login is often CSRF-exempt.
-    /// </summary>
-    static string Masked(string token)
-    {
-        var tok = Encoding.UTF8.GetBytes(token);
-        var rnd = System.Security.Cryptography.RandomNumberGenerator.GetBytes(tok.Length);
-        var combined = new byte[tok.Length * 2];
-        Buffer.BlockCopy(rnd, 0, combined, 0, rnd.Length);
-        for (int i = 0; i < tok.Length; i++) combined[tok.Length + i] = (byte)(rnd[i] ^ tok[i]);
-        return Convert.ToBase64String(combined).Replace('+', '-').Replace('/', '_');
-    }
-
     // ---- session ----
 
     async Task<SessionState> EnsureAsync(CancellationToken ct)
@@ -352,9 +316,8 @@ public sealed class DescoApi : IDisposable
     }
 
     /// <summary>
-    /// Is the session still alive? /api/session does NOT exist on this portal (404), so
-    /// /api/accounts is the probe: it is the cheapest authenticated call, and we need
-    /// its payload anyway to resolve the accountId.
+    /// Is the session still alive? /api/accounts is the probe: it is the cheapest
+    /// authenticated call, and we need its payload anyway to resolve the accountId.
     /// </summary>
     async Task<bool> ProbeAsync(CancellationToken ct)
     {
@@ -550,62 +513,38 @@ public sealed class DescoApi : IDisposable
     // ---- authed POST ----
 
     /// <summary>
-    /// POST with the CSRF header. Used only for realtime-balance, which is a COMMAND —
-    /// it asks the meter for a fresh reading — rather than a query. That is why it must
-    /// never be called speculatively: each call either spends the day's allowance or is
-    /// refused with DAILY_LIMIT_REACHED.
+    /// POST to realtime-balance, shaped exactly like the portal's own button: the raw
+    /// XSRF token in X-XSRF-TOKEN, and a JSON body carrying a fresh idempotencyKey.
+    /// Without the key DESCO answers 500 INTERNAL_ERROR (confirmed 2026-11-11).
     ///
-    /// It adapts to what the portal accepts, because the portal's button works and the
-    /// app's request has to match it:
+    /// A COMMAND, not a query — it asks the meter for a fresh reading — so it must never
+    /// be called speculatively.
     ///
-    ///   • 403 → resend once with the CSRF token in the OTHER form (raw ↔ masked).
-    ///   • 400 / 415 / 422 → resend once with the OTHER body ("{}" ↔ empty).
-    ///   • Whatever works is remembered, so later refreshes go right first time.
+    /// One key per user tap. It is reused on the single re-login retry below, so if the
+    /// first attempt did reach the meter, DESCO can recognise the repeat rather than
+    /// counting it as a second attempt.
     ///
-    /// Every one of those is a request the server REJECTED before running it, so a
-    /// resend cannot spend the day's read. Anything that may have run — a timeout, a
-    /// dropped connection, a 5xx — is never resent; the caller checks the free cached
-    /// reading instead to see whether the read landed.
-    ///
-    /// Only after both CSRF forms are refused does it treat the session as dead and do
-    /// the single re-login retry GetAsync does.
-    ///
-    /// The Note says what happened, so a person who pressed refresh can be told why the
-    /// balance didn't move.
+    /// Anything that may have run — a timeout, a dropped connection, a 5xx — is never
+    /// resent; the caller checks the free cached reading instead to see whether the read
+    /// landed. The Note says what happened, so a person who pressed refresh can be told
+    /// why the balance didn't move.
     /// </summary>
     public async Task<(JsonElement? Node, SessionState State, string Note)> PostAsync(
-        string path, CancellationToken ct, bool isRetry = false)
+        string path, CancellationToken ct, string? idempotencyKey = null, bool isRetry = false)
     {
         var st = await EnsureAsync(ct);
         if (st != SessionState.Ok) return (null, st, st.ToString());
 
-        bool masked = PostMasked, empty = PostEmptyBody;
-        bool triedMask = false, triedBody = false;
-        int code;
-        string text;
-        var trail = new List<string>();
+        idempotencyKey ??= Guid.NewGuid().ToString();
 
-        while (true)
-        {
-            var (c, t, error) = await SendPostAsync(path, masked, empty, ct);
+        var (code, text, error) = await SendPostAsync(path, idempotencyKey, ct);
 
-            // No answer at all. The command may have reached the meter, so it must not be
-            // sent again — the caller polls the free cached read instead.
-            if (error != null) return (null, SessionState.Unreachable, error);
-
-            code = c;
-            text = t;
-            trail.Add($"{(masked ? "masked" : "raw")}{(empty ? "+empty" : "")}:{code}");
-
-            if (code == 403 && !triedMask) { triedMask = true; masked = !masked; continue; }
-            if ((code is 400 or 415 or 422) && !triedBody) { triedBody = true; empty = !empty; continue; }
-            break;
-        }
+        // No answer at all. The command may have reached the meter, so it must not be
+        // sent again — the caller polls the free cached read instead.
+        if (error != null) return (null, SessionState.Unreachable, error);
 
         if (code is >= 200 and < 300)
         {
-            PostMasked = masked;
-            PostEmptyBody = empty;
             await SaveJarAsync();
             try
             {
@@ -622,24 +561,23 @@ public sealed class DescoApi : IDisposable
         if (code is not (401 or 403))
         {
             await SaveJarAsync();
-            return (null, SessionState.Ok,
-                $"HTTP {code} {Snippet(text)}".Trim() + (trail.Count > 1 ? $" [{string.Join(", ", trail)}]" : ""));
+            return (null, SessionState.Ok, Describe(code, text));
         }
 
-        // 401, or 403 in both CSRF forms: the session itself is refused.
-        if (isRetry) return (null, SessionState.NeedsLogin, "after re-login: " + string.Join(", ", trail));
+        // 401/403: the session itself was refused. One re-login, same key.
+        if (isRetry) return (null, SessionState.NeedsLogin, $"HTTP {code} after re-login");
         _goodUntil = DateTimeOffset.MinValue;
         try { SecureStorage.Remove(KJar(_account)); } catch { }
-        return await Recycle(_account).PostAsync(path, ct, isRetry: true);
+        return await Recycle(_account).PostAsync(path, ct, idempotencyKey, isRetry: true);
     }
 
     /// <summary>
-    /// One realtime POST, shaped like the portal's own: CSRF header, JSON or empty body,
-    /// and the Origin / Referer / X-Requested-With a browser page sends. Returns the
-    /// status and body, or an Error when no answer came back at all.
+    /// One realtime POST, shaped like the portal's own (captured 2026-11-11): raw CSRF
+    /// header, JSON body with the idempotency key, Origin and Referer as a browser page
+    /// sends them. Returns the status and body, or an Error when no answer came back.
     /// </summary>
     async Task<(int Code, string Text, string? Error)> SendPostAsync(
-        string path, bool masked, bool emptyBody, CancellationToken ct)
+        string path, string idempotencyKey, CancellationToken ct)
     {
         // The portal clears and re-issues XSRF-TOKEN on every response, and Spring can
         // leave it absent straight after a login or a refusal. Make sure one is in the jar.
@@ -648,21 +586,18 @@ public sealed class DescoApi : IDisposable
         using var lim = Limit(ct, PostTimeout);
         try
         {
+            var body = new JsonObject { ["idempotencyKey"] = idempotencyKey }.ToJsonString();
             using var req = new HttpRequestMessage(HttpMethod.Post, Wire.Base + path)
             {
-                Content = emptyBody
-                    ? new ByteArrayContent(Array.Empty<byte>())
-                    : new StringContent("{}", Encoding.UTF8, "application/json")
+                Content = new StringContent(body, Encoding.UTF8, "application/json")
             };
 
+            // Raw cookie value, as the portal sends it (header == cookie in the capture).
             if (Csrf() is { } c)
-            {
-                var raw = Uri.UnescapeDataString(c);
-                req.Headers.TryAddWithoutValidation(Wire.CsrfHeader, masked ? Masked(raw) : raw);
-            }
-            req.Headers.Referrer = new Uri(Wire.Base + "/dashboard");
+                req.Headers.TryAddWithoutValidation(Wire.CsrfHeader, Uri.UnescapeDataString(c));
+
+            req.Headers.Referrer = new Uri(Wire.Base + "/balance");
             req.Headers.TryAddWithoutValidation("Origin", Wire.Base);
-            req.Headers.TryAddWithoutValidation("X-Requested-With", "XMLHttpRequest");
 
             using var res = await _http.SendAsync(req, lim.Token);
 
@@ -676,6 +611,25 @@ public sealed class DescoApi : IDisposable
         catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
         catch (OperationCanceledException) { return (0, "", "timeout"); }
         catch (Exception e) { return (0, "", e.Message); }
+    }
+
+    /// <summary>
+    /// DESCO's error body → "HTTP 500: Something went wrong… (ref cid-…)". Raw JSON in a
+    /// popup reads as a crash. Keeps the "HTTP 5" prefix FreshReadAsync checks for.
+    /// </summary>
+    static string Describe(int code, string text)
+    {
+        try
+        {
+            using var d = JsonDocument.Parse(text);
+            var r = d.RootElement;
+            if (r.ValueKind == JsonValueKind.Object
+                && r.TryGetProperty("message", out var m) && m.GetString() is { } msg)
+                return $"HTTP {code}: {msg}"
+                     + (r.TryGetProperty("correlationId", out var c) ? $" (ref {c.GetString()})" : "");
+        }
+        catch { }
+        return $"HTTP {code} {Snippet(text)}".Trim();
     }
 
     static string Snippet(string text)
